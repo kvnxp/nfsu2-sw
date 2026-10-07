@@ -42,6 +42,11 @@ void xa2_get_stats(Xa2Stats *out);
  * the guest or the mixers produce can reach full scale in a headset. */
 void xa2_set_master_volume(float v);
 
+/* The same volume in percent, 0..100, for the settings menu (and the cfg
+ * file). RECOMP_AUDIO_VOLUME still sets it at boot. */
+void xbox_AudioSetVolume100(int pct);
+int  xbox_AudioGetVolume100(void);
+
 /* The same volume + limiter, for any other output path (waveOut). in and out
  * may be the same buffer. */
 void apu_output_safety(const int16_t *in, int16_t *out, int n);

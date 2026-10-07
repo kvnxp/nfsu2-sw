@@ -41,6 +41,7 @@
 #include "../nv2a_gl/gl_psh.h"
 #include "../nv2a_gl/gl_vsh.h"
 #include "../kernel/nv2a_backend.h"
+#include "../platform/xbox_cfg.h"       /* SCALE/VSYNC, before ready() */
 
 #if defined(__SWITCH__)
 #include <switch.h>
@@ -66,6 +67,12 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static int s_state;            /* 0 untried, 1 ready, -1 failed */
 static int s_trace;
+/* The settings menu (below) applies these between frames. */
+static double s_scale = 1.0;
+static int    s_vsync = -1;     /* -1 auto (whatever the driver prefers), 0 off, 1 on (FIFO) */
+static int    s_sc_vsync;       /* whether the swapchain as built waits for vblank */
+static int    s_scale_pending, s_vsync_pending;
+static double s_scale_new = 1.0;
 /* RECOMP_VK_TRACE=<n>: name every step of the first n draws, clears and
  * flips (a crash inside the driver then ends the log at the step). */
 static int s_vtrace;
@@ -189,6 +196,8 @@ static uint32_t s_cb_gen;      /* bumped at every vkBeginCommandBuffer */
 static int s_dyn_valid;
 
 static void garbage_add_pipe(VkPipeline pipe);
+static int create_swapchain(void);
+static void renderer_reset_caches(void);
 static void garbage_add(VkImage img, VkImageView view, VkDeviceMemory mem)
 {
     Frame *f = s_f;
@@ -224,6 +233,19 @@ static void garbage_free(Frame *f)
 static void frame_begin(void)
 {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    /* The settings menu applies between frames, when this slot's commands
+     * are done: a vsync change rebuilds the swapchain, a scale change the
+     * cached surfaces and depth (their stored pixels are the old scale). */
+    if (s_vsync_pending) {
+        vkDeviceWaitIdle(s_dev);
+        create_swapchain();
+        s_vsync_pending = 0;
+    }
+    if (s_scale_pending) {
+        s_scale = s_scale_new;
+        s_scale_pending = 0;
+        renderer_reset_caches();
+    }
     s_f = &s_fr[s_fi];
     if (s_f->submitted) {
         vkWaitForFences(s_dev, 1, &s_f->fence, VK_TRUE, UINT64_MAX);
@@ -288,8 +310,8 @@ typedef struct {
 
 /* RECOMP_GL_SCALE, as in nv2a_gl: only the pixels behind a surface grow, so
  * the viewport, clear rectangles, read-backs and the present blit scale and
- * nothing else does. Capped per surface by the device's image limits. */
-static double   s_scale = 1.0;
+ * nothing else does. Capped per surface by the device's image limits.
+ * (s_scale itself is declared with the menu state at the top.) */
 static uint32_t s_max_size = 4096;
 
 /* v title pixels of a surface l wide, in the p stored pixels behind it. */
@@ -586,6 +608,31 @@ static VkDepthBuf *depth_get(uint32_t va, uint32_t pw, uint32_t ph)
 
 /* The target of a draw or clear: surface (created on first use) and the
  * depth buffer of its zeta address. */
+/* Drop every cached surface and depth buffer, for a render-scale change:
+ * their stored pixels are the old scale, so the next draw rebuilds each.
+ * Images are freed through the garbage two frames later, so a frame still
+ * flying keeps its own (vkCmdBindVertexBuffers-style handles, not the
+ * table, are what its commands reference). */
+static void renderer_reset_caches(void)
+{
+    uint32_t i;
+    for (i = 0; i < VK_MAX_SURF; i++) {
+        if (!s_surf[i].image)
+            continue;
+        if (s_rt == &s_surf[i]) { end_rendering(); s_rt = NULL; }
+        if (s_last == &s_surf[i]) s_last = NULL;
+        garbage_add(s_surf[i].image, s_surf[i].view, s_surf[i].mem);
+        memset(&s_surf[i], 0, sizeof s_surf[i]);
+    }
+    for (i = 0; i < VK_MAX_DEPTH; i++) {
+        if (!s_depth[i].image)
+            continue;
+        if (s_rt_depth == &s_depth[i]) s_rt_depth = NULL;
+        garbage_add(s_depth[i].image, s_depth[i].view, s_depth[i].mem);
+        memset(&s_depth[i], 0, sizeof s_depth[i]);
+    }
+}
+
 static VkSurf *target(const Nv2aSurface *sf, uint32_t zeta_va, VkDepthBuf **dout)
 {
     uint32_t bpp = sf->bytes_per_pixel ? sf->bytes_per_pixel : 4;
@@ -1941,10 +1988,15 @@ static int create_swapchain(void)
         }
     /* The game paces itself (vblank emulation): presenting must not block
      * it. Horizon's immediate mode does not tear (nvnflinger composes). */
-    for (i = 0; i < nm; i++)
-        if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = modes[i];
-    for (i = 0; i < nm && mode == VK_PRESENT_MODE_FIFO_KHR; i++)
-        if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = modes[i];
+    if (s_vsync == 1) {
+        mode = VK_PRESENT_MODE_FIFO_KHR;   /* guaranteed everywhere */
+    } else if (s_vsync != 0) {
+        for (i = 0; i < nm; i++)
+            if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = modes[i];
+        for (i = 0; i < nm && mode == VK_PRESENT_MODE_FIFO_KHR; i++)
+            if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = modes[i];
+    }
+    s_sc_vsync = (mode == VK_PRESENT_MODE_FIFO_KHR);
     s_sc_extent = caps.currentExtent;
     if (s_sc_extent.width == 0xFFFFFFFFu) {
         s_sc_extent.width = 1280;
@@ -2118,6 +2170,14 @@ static int ready(void)
         const char *e = getenv("RECOMP_GL_SCALE");
         double k = e ? strtod(e, NULL) : 1.0;
         uint32_t m = pp.limits.maxImageDimension2D;
+#if !defined(_WIN32)
+        if (!e) {
+            /* The settings menu keeps SCALE in the cfg when no variable wins. */
+            char v[16];
+            if (xbox_CfgGet("SCALE", v, sizeof v))
+                k = strtod(v, NULL);
+        }
+#endif
         if (pp.limits.maxFramebufferWidth < m) m = pp.limits.maxFramebufferWidth;
         if (pp.limits.maxFramebufferHeight < m) m = pp.limits.maxFramebufferHeight;
         s_max_size = m ? m : 4096;
@@ -2126,6 +2186,22 @@ static int ready(void)
         if (s_scale != 1.0)
             fprintf(stderr, "  [VK] rendering at %gx (RECOMP_GL_SCALE), surfaces up to %u\n",
                     s_scale, s_max_size);
+    }
+    {
+        /* The settings menu keeps VSYNC there when RECOMP_VSYNC is unset:
+         * 1 waits for vblank, 0 presents as fast as the driver lets it. */
+        const char *e = getenv("RECOMP_VSYNC");
+#if !defined(_WIN32)
+        char v[16];
+#endif
+        if (e)
+            s_vsync = atoi(e) ? 1 : 0;
+#if !defined(_WIN32)
+        else if (xbox_CfgGet("VSYNC", v, sizeof v))
+            s_vsync = atoi(v) ? 1 : 0;
+#endif
+        if (s_vsync >= 0)
+            fprintf(stderr, "  [VK] vsync %s\n", s_vsync ? "on" : "off");
     }
     if (s_ubo_align < 16) s_ubo_align = 16;
     vkGetPhysicalDeviceMemoryProperties(s_pd, &s_memprops);
@@ -3477,25 +3553,13 @@ static void dump_surface(VkSurf *s, const char *path)
 void xbox_KeyState(int scancode, int down);  /* xinput_device.c */
 void xbox_KeyClear(void);
 
-/* F1: the keyboard map, as a native dialog. */
-static void show_key_help(void)
-{
-    static const char map[] =
-        "Flechas ............. d-pad\n"
-        "Enter ............... START\n"
-        "Backspace ........... BACK\n"
-        "Z X A S ............. A   B   X   Y\n"
-        "Q E ................. White / Black\n"
-        "1 3 ................. gatillos L / R\n"
-        "Numpad 8 2 4 6 ...... stick izquierdo (o teclas 8 2 4 6)\n"
-        "I K J L ............. stick derecho\n"
-        "Shift / Ctrl ........ stick izquierdo / derecho (boton)\n"
-        "\n"
-        "RECOMP_KEYBOARD=1 activa el teclado, =0 lo desactiva.\n"
-        "RECOMP_KEY_TRACE=1 lista las teclas que llegan a la ventana.";
-
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "Teclado - NFSU2", map, s_win);
-}
+/* The F1 settings menu lives below (it needs the whole renderer around
+ * it); the pump only toggles it and feeds it keys. */
+#if !defined(__SWITCH__) && !defined(_WIN32)
+void xbox_MenuToggle(void);
+int xbox_MenuOpen(void);
+static void menu_key(SDL_Scancode sc, SDL_Keycode sym);
+#endif
 
 /* The window's events, in one place: close (the X), F1, RECOMP_KEY_TRACE.
  * Called from the process' main thread on macOS (nv2a_vk_pump) and from
@@ -3526,9 +3590,478 @@ static void pump_events(void)
                     e.type == SDL_KEYDOWN ? "down " : "up   ",
                     e.key.repeat ? "rep " : "    ",
                     SDL_GetScancodeName(e.key.keysym.scancode));
-        if (e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.sym == SDLK_F1)
-            show_key_help();
+        if (e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.sym == SDLK_F1) {
+            xbox_MenuToggle();          /* the settings menu (below) */
+        } else if (xbox_MenuOpen() && e.type == SDL_KEYDOWN) {
+            menu_key(e.key.keysym.scancode, e.key.keysym.sym);
+        }
     }
+}
+#endif
+
+#if !defined(__SWITCH__) && !defined(_WIN32)
+#include "../apu/apu_xaudio2.h"            /* volume */
+
+/* Win32 virtual keys for the key rows, as in win32_compat.h (stable ABI;
+ * that header is not included here: it pulls the platform vocabulary). */
+enum {
+    MVK_BACK = 0x08, MVK_RETURN = 0x0D, MVK_SHIFT = 0x10, MVK_CONTROL = 0x11,
+    MVK_LEFT = 0x25, MVK_UP = 0x26, MVK_RIGHT = 0x27, MVK_DOWN = 0x28,
+    MVK_NUMPAD2 = 0x62, MVK_NUMPAD4 = 0x64, MVK_NUMPAD6 = 0x66, MVK_NUMPAD8 = 0x68,
+};
+
+int xbox_MenuOpen(void);
+void xbox_MenuToggle(void);
+int  xbox_KbOverrideGet(int vk);
+void xbox_KbOverrideSet(int vk, int scancode);
+void xbox_KbOverrideClear(void);
+void xbox_KbSave(void);
+
+/* ── Settings menu (F1) ───────────────────────────────────────────────
+ *
+ * A text panel drawn over the presented frame, in the corner: GRAPHICS
+ * (render scale x1/x2/x3 applied live, vsync), KEYBOARD (every action
+ * remappable: Enter captures the next key, twice for a stick axis),
+ * AUDIO (volume). Arrows move and adjust, Enter activates, Esc closes.
+ * Everything persists in nfsu2.cfg next to the working directory;
+ * RECOMP_MENU_OPEN=1 opens it at boot (to look at it without a keyboard).
+ *
+ * No system font is assumed: a 5x7 bitmap font, scaled 2x, rasterized when
+ * the menu changes and blitted opaque after the frame (vkCmdBlitImage
+ * replaces, it does not blend, so the panel has its own background). */
+
+/* 5 bytes per glyph, bit 0 = top row. */
+static const char s_font_chars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:-/.()+%_?";
+static const uint8_t s_font_data[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, {0x7e,0x11,0x11,0x11,0x7e}, {0x7f,0x49,0x49,0x49,0x36},
+    {0x3e,0x41,0x41,0x41,0x22}, {0x7f,0x41,0x41,0x22,0x1c}, {0x7f,0x49,0x49,0x49,0x41},
+    {0x7f,0x09,0x09,0x09,0x01}, {0x3e,0x41,0x49,0x49,0x7a}, {0x7f,0x08,0x08,0x08,0x7f},
+    {0x00,0x41,0x7f,0x41,0x00}, {0x20,0x40,0x41,0x3f,0x01}, {0x7f,0x08,0x14,0x22,0x41},
+    {0x7f,0x40,0x40,0x40,0x40}, {0x7f,0x02,0x0c,0x02,0x7f}, {0x7f,0x04,0x08,0x10,0x7f},
+    {0x3e,0x41,0x41,0x41,0x3e}, {0x7f,0x09,0x09,0x09,0x06}, {0x3e,0x41,0x51,0x21,0x5e},
+    {0x7f,0x09,0x19,0x29,0x46}, {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7f,0x01,0x01},
+    {0x7f,0x40,0x40,0x40,0x7f}, {0x1f,0x20,0x40,0x20,0x1f}, {0x7f,0x20,0x18,0x20,0x7f},
+    {0x63,0x14,0x08,0x14,0x63}, {0x07,0x08,0x70,0x08,0x07}, {0x61,0x51,0x49,0x45,0x43},
+    {0x3e,0x51,0x49,0x45,0x3e}, {0x00,0x42,0x7f,0x40,0x00}, {0x42,0x61,0x51,0x49,0x46},
+    {0x21,0x41,0x45,0x4b,0x31}, {0x18,0x14,0x12,0x7f,0x10}, {0x27,0x45,0x45,0x45,0x39},
+    {0x3c,0x4a,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1e}, {0x00,0x36,0x36,0x00,0x00}, {0x08,0x08,0x08,0x08,0x08},
+    {0x20,0x10,0x08,0x04,0x02}, {0x00,0x60,0x60,0x00,0x00}, {0x00,0x1c,0x22,0x41,0x00},
+    {0x00,0x41,0x22,0x1c,0x00}, {0x08,0x08,0x3e,0x08,0x08}, {0x62,0x64,0x08,0x13,0x23},
+    {0x40,0x40,0x40,0x40,0x40}, {0x02,0x01,0x51,0x09,0x06},
+};
+
+static const uint8_t *font_get(char c)
+{
+    const char *p;
+    if (c >= 'a' && c <= 'z')
+        c -= (char)('a' - 'A');
+    p = strchr(s_font_chars, c);
+    if (!p)
+        p = strchr(s_font_chars, '?');
+    return s_font_data[p - s_font_chars];
+}
+
+enum { MK_HEAD, MK_SCALE, MK_VSYNC, MK_KEY, MK_KEY2, MK_KEYRESET, MK_VOL };
+typedef struct { int kind; const char *label; int vk, vk2, d1, d2; } MenuRow;
+static const MenuRow s_menu_rows[] = {
+    { MK_HEAD, "GRAPHICS", 0, 0, 0, 0 },
+    { MK_SCALE, "SCALE", 0, 0, 0, 0 },
+    { MK_VSYNC, "VSYNC", 0, 0, 0, 0 },
+    { MK_HEAD, "KEYBOARD - ENTER TO CHANGE", 0, 0, 0, 0 },
+    { MK_KEY, "UP", MVK_UP, -1, SDL_SCANCODE_UP, -1 },
+    { MK_KEY, "DOWN", MVK_DOWN, -1, SDL_SCANCODE_DOWN, -1 },
+    { MK_KEY, "LEFT", MVK_LEFT, -1, SDL_SCANCODE_LEFT, -1 },
+    { MK_KEY, "RIGHT", MVK_RIGHT, -1, SDL_SCANCODE_RIGHT, -1 },
+    { MK_KEY, "START", MVK_RETURN, -1, SDL_SCANCODE_RETURN, -1 },
+    { MK_KEY, "BACK", MVK_BACK, -1, SDL_SCANCODE_BACKSPACE, -1 },
+    { MK_KEY, "LEFT STICK BTN", MVK_SHIFT, -1, SDL_SCANCODE_LSHIFT, -1 },
+    { MK_KEY, "RIGHT STICK BTN", MVK_CONTROL, -1, SDL_SCANCODE_LCTRL, -1 },
+    { MK_KEY, "BUTTON A", 'Z', -1, SDL_SCANCODE_Z, -1 },
+    { MK_KEY, "BUTTON B", 'X', -1, SDL_SCANCODE_X, -1 },
+    { MK_KEY, "BUTTON X", 'A', -1, SDL_SCANCODE_A, -1 },
+    { MK_KEY, "BUTTON Y", 'S', -1, SDL_SCANCODE_S, -1 },
+    { MK_KEY, "WHITE", 'Q', -1, SDL_SCANCODE_Q, -1 },
+    { MK_KEY, "BLACK", 'E', -1, SDL_SCANCODE_E, -1 },
+    { MK_KEY, "LEFT TRIGGER", '1', -1, SDL_SCANCODE_1, -1 },
+    { MK_KEY, "RIGHT TRIGGER", '3', -1, SDL_SCANCODE_3, -1 },
+    { MK_KEY2, "LEFT STICK X", MVK_NUMPAD4, MVK_NUMPAD6, SDL_SCANCODE_KP_4, SDL_SCANCODE_KP_6 },
+    { MK_KEY2, "LEFT STICK Y", MVK_NUMPAD2, MVK_NUMPAD8, SDL_SCANCODE_KP_2, SDL_SCANCODE_KP_8 },
+    { MK_KEY2, "RIGHT STICK X", 'J', 'L', SDL_SCANCODE_J, SDL_SCANCODE_L },
+    { MK_KEY2, "RIGHT STICK Y", 'K', 'I', SDL_SCANCODE_K, SDL_SCANCODE_I },
+    { MK_KEYRESET, "RESET KEYBOARD", 0, 0, 0, 0 },
+    { MK_HEAD, "AUDIO", 0, 0, 0, 0 },
+    { MK_VOL, "VOLUME", 0, 0, 0, 0 },
+};
+#define MENU_NROWS (sizeof s_menu_rows / sizeof s_menu_rows[0])
+#define MENU_COLS 52
+#define MENU_PW (MENU_COLS * 12)
+#define MENU_PH (32 * 16)
+
+static int s_menu_sel = 1;      /* selected row; headers are skipped */
+static int s_menu_cap;          /* 0 none, 1 one key, 2 axis negative, 3 axis positive */
+static int s_menu_cap_row;
+static int s_menu_dirty = 1;
+static VkImage s_menu_img;
+static VkImageView s_menu_view;
+static VkDeviceMemory s_menu_mem;
+static uint8_t *s_menu_px;
+
+/* A scancode's name in the font's alphabet (uppercase ASCII, '?' else).
+ * "Keypad 4" becomes "KP 4": the panel is 52 columns wide. */
+static void menu_key_name(int sc, char *out, size_t cap)
+{
+    const char *n = (sc > 0 && sc < (int)SDL_NUM_SCANCODES) ? SDL_GetScancodeName((SDL_Scancode)sc) : "";
+    size_t i = 0, j = 0;
+    char tmp[32];
+    if (!n || !n[0]) {
+        snprintf(out, cap, "?");
+        return;
+    }
+    if (!strncmp(n, "Keypad ", 7)) {
+        tmp[0] = 'K'; tmp[1] = 'P'; tmp[2] = ' ';
+        strncpy(tmp + 3, n + 7, sizeof tmp - 4);
+        tmp[sizeof tmp - 1] = 0;
+        n = tmp;
+    }
+    while (n[j] && i + 1 < cap) {
+        char c = n[j++];
+        if (c >= 'a' && c <= 'z') c -= (char)('a' - 'A');
+        if (!strchr(s_font_chars, c)) c = '?';
+        out[i++] = c;
+    }
+    out[i] = 0;
+}
+
+/* The row's current value, right of the dots. */
+static void menu_value(const MenuRow *r, char *out, size_t cap)
+{
+    char a[24], b[24];
+    int o;
+    switch (r->kind) {
+    case MK_SCALE: {
+        double v = s_scale_pending ? s_scale_new : s_scale;
+        int k = (int)(v + 0.5);
+        if (k < 1) k = 1;
+        if (k > 3) k = 3;
+        snprintf(out, cap, "X%d", k);
+        return;
+    }
+    case MK_VSYNC:
+        snprintf(out, cap, "%s", s_sc_vsync ? "ON" : "OFF");
+        return;
+    case MK_VOL:
+        snprintf(out, cap, "%d", xbox_AudioGetVolume100());
+        return;
+    case MK_KEY:
+        o = xbox_KbOverrideGet(r->vk);
+        menu_key_name(o >= 0 ? o : r->d1, out, cap);
+        if (o >= 0 && strlen(out) + 2 < cap)
+            strcat(out, " *");
+        return;
+    case MK_KEY2: {
+        int o1 = xbox_KbOverrideGet(r->vk), o2 = xbox_KbOverrideGet(r->vk2);
+        menu_key_name(o1 >= 0 ? o1 : r->d1, a, sizeof a);
+        menu_key_name(o2 >= 0 ? o2 : r->d2, b, sizeof b);
+        snprintf(out, cap, "%s / %s", a, b);
+        return;
+    }
+    default:
+        out[0] = 0;
+    }
+}
+
+static void menu_text(uint32_t x, uint32_t y, const char *s, int inv)
+{
+    /* x, y in character cells (12x16 px each). Alpha stays 255. */
+    uint32_t cx = x * 12, cy = y * 16;
+    const uint8_t *g;
+    int xi, yi;
+    for (; *s && cx + 12 <= MENU_PW; s++, cx += 12) {
+        char c = *s;
+        uint32_t ox, oy;
+        uint8_t *p;
+        uint8_t r, gg, b;
+        if (c >= 'a' && c <= 'z') c -= (char)('a' - 'A');
+        g = font_get(c);
+        for (xi = 0; xi < 5; xi++) {
+            for (yi = 0; yi < 7; yi++) {
+                int bit = (g[xi] >> yi) & 1;
+                if (bit ^ inv) { r = gg = b = 255; } else { r = gg = 10; b = 22; }
+                ox = cx + (uint32_t)xi * 2;
+                oy = cy + (uint32_t)yi * 2;
+                p = &s_menu_px[(oy * MENU_PW + ox) * 4];         p[0] = r; p[1] = gg; p[2] = b;
+                p = &s_menu_px[(oy * MENU_PW + ox + 1) * 4];     p[0] = r; p[1] = gg; p[2] = b;
+                p = &s_menu_px[((oy + 1) * MENU_PW + ox) * 4];   p[0] = r; p[1] = gg; p[2] = b;
+                p = &s_menu_px[((oy + 1) * MENU_PW + ox + 1) * 4]; p[0] = r; p[1] = gg; p[2] = b;
+            }
+        }
+    }
+}
+
+static void menu_build(void)
+{
+    uint8_t dark[4] = { 10, 10, 22, 255 }, lite[4] = { 255, 255, 255, 255 };
+    int i, li = 0, py, px;
+
+    for (py = 0; py < (int)MENU_PH; py++)
+        for (px = 0; px < (int)MENU_PW; px++)
+            memcpy(&s_menu_px[(py * MENU_PW + px) * 4],
+                   (px < 2 || py < 2 || px >= (int)MENU_PW - 2 || py >= (int)MENU_PH - 2) ? lite : dark, 4);
+    menu_text(1, 0, "SETTINGS - F1 CLOSES", 0);
+    for (i = 0; i < (int)MENU_NROWS; i++) {
+        const MenuRow *r = &s_menu_rows[i];
+        char line[64], v[32];
+        if (r->kind == MK_HEAD) {
+            snprintf(line, sizeof line, "%s", r->label);
+        } else {
+            int n;
+            menu_value(r, v, sizeof v);
+            snprintf(line, sizeof line, "%s", r->label);
+            n = (int)strlen(line);
+            while (n < 34 && n < (int)sizeof line - 1)
+                line[n++] = '.';
+            line[n] = 0;
+            snprintf(line + n, sizeof line - (size_t)n, " %s", v);
+        }
+        menu_text(1, (uint32_t)(li + 2), line, i == s_menu_sel ? 1 : 0);
+        li++;
+    }
+    if (s_menu_cap)
+        menu_text(1, (uint32_t)(li + 2), "PRESS A KEY (ESC CANCELS)", 0);
+    else {
+        menu_text(1, (uint32_t)(li + 2), "ARROWS MOVE ENTER SELECT", 0);
+        menu_text(1, (uint32_t)(li + 3), "LEFT RIGHT ADJUST ESC QUIT", 0);
+    }
+}
+
+static int menu_scale_cur(void)
+{
+    double v = s_scale_pending ? s_scale_new : s_scale;
+    int k = (int)(v + 0.5);
+    return k < 1 ? 1 : k > 3 ? 3 : k;
+}
+
+static void menu_apply_scale(int k)
+{
+    char v[8];
+    if (k < 1) k = 1;
+    if (k > 3) k = 3;
+    snprintf(v, sizeof v, "%d", k);
+    xbox_CfgSet("SCALE", v);
+    s_scale_new = (double)k;
+    s_scale_pending = 1;
+    s_menu_dirty = 1;
+    fprintf(stderr, "  [VK] render scale x%d at the next frame\n", k);
+}
+
+static void menu_apply_vsync(int on)
+{
+    char v[8];
+    snprintf(v, sizeof v, "%d", on ? 1 : 0);
+    xbox_CfgSet("VSYNC", v);
+    s_vsync = on ? 1 : 0;
+    s_vsync_pending = 1;
+    s_menu_dirty = 1;
+    fprintf(stderr, "  [VK] vsync %s at the next frame\n", on ? "on" : "off");
+}
+
+static void menu_apply_volume(int v)
+{
+    char s[16];
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    xbox_AudioSetVolume100(v);
+    snprintf(s, sizeof s, "%d", v);
+    xbox_CfgSet("VOLUME", s);
+    s_menu_dirty = 1;
+}
+
+static void menu_move(int dir)
+{
+    int i = s_menu_sel;
+    do {
+        i += dir;
+        if (i < 0) i = (int)MENU_NROWS - 1;
+        if (i >= (int)MENU_NROWS) i = 0;
+    } while (s_menu_rows[i].kind == MK_HEAD);
+    s_menu_sel = i;
+    s_menu_dirty = 1;
+}
+
+static void menu_adjust(int dir)
+{
+    const MenuRow *r = &s_menu_rows[s_menu_sel];
+    if (r->kind == MK_SCALE) {
+        int k = menu_scale_cur() + dir;
+        menu_apply_scale(k < 1 ? 3 : k > 3 ? 1 : k);
+    } else if (r->kind == MK_VSYNC) {
+        menu_apply_vsync(!s_sc_vsync);
+    } else if (r->kind == MK_VOL) {
+        menu_apply_volume(xbox_AudioGetVolume100() + dir * 5);
+    }
+}
+
+static void menu_activate(void)
+{
+    const MenuRow *r = &s_menu_rows[s_menu_sel];
+    if (r->kind == MK_SCALE) {
+        int k = menu_scale_cur() + 1;
+        menu_apply_scale(k > 3 ? 1 : k);
+    } else if (r->kind == MK_VSYNC) {
+        menu_apply_vsync(!s_sc_vsync);
+    } else if (r->kind == MK_KEY) {
+        s_menu_cap = 1;
+        s_menu_cap_row = s_menu_sel;
+    } else if (r->kind == MK_KEY2) {
+        s_menu_cap = 2;
+        s_menu_cap_row = s_menu_sel;
+    } else if (r->kind == MK_KEYRESET) {
+        xbox_KbOverrideClear();
+        xbox_KbSave();
+    }
+    s_menu_dirty = 1;
+}
+
+/* One key while the menu is open (F1/Escape handled by the pump). */
+static void menu_key(SDL_Scancode sc, SDL_Keycode sym)
+{
+    if (s_menu_cap) {
+        const MenuRow *r;
+        if (sym == SDLK_ESCAPE) {
+            s_menu_cap = 0;
+        } else {
+            r = &s_menu_rows[s_menu_cap_row];
+            xbox_KbOverrideSet(s_menu_cap == 3 ? r->vk2 : r->vk, (int)sc);
+            if (r->kind == MK_KEY2 && s_menu_cap == 2)
+                s_menu_cap = 3;
+            else {
+                s_menu_cap = 0;
+                xbox_KbSave();
+            }
+        }
+        s_menu_dirty = 1;
+        return;
+    }
+    switch (sc) {
+    case SDL_SCANCODE_UP: menu_move(-1); break;
+    case SDL_SCANCODE_DOWN: menu_move(1); break;
+    case SDL_SCANCODE_LEFT: menu_adjust(-1); break;
+    case SDL_SCANCODE_RIGHT: menu_adjust(1); break;
+    case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: menu_activate(); break;
+    case SDL_SCANCODE_ESCAPE: xbox_MenuToggle(); break;
+    default: break;
+    }
+    s_menu_dirty = 1;
+}
+
+static int menu_blit_format(void)
+{
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(s_pd, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)
+        return 0;
+    return 1;                       /* fall back to the surface format */
+}
+
+/* The panel over the presented frame, after the frame's own blit. dst is
+ * still TRANSFER_DST_OPTIMAL here. */
+static void menu_draw(VkImage dst)
+{
+    VkDeviceSize size = (VkDeviceSize)MENU_PW * MENU_PH * 4;
+    void *staging;
+    VkDeviceSize at;
+    VkBufferImageCopy rg;
+    VkImageMemoryBarrier ib;
+    VkImageBlit bl;
+    uint32_t dw = MENU_PW, dh = MENU_PH;
+
+    {
+        static int was_open, reported;
+        int open = xbox_MenuOpen();
+        if (open && !was_open)
+            s_menu_dirty = 1;
+        was_open = open;
+        if (!open || s_headless)
+            return;
+        if (!reported) {
+            reported = 1;
+            fprintf(stderr, "  [MENU] drawing, extent %ux%u\n",
+                    s_sc_extent.width, s_sc_extent.height);
+        }
+    }
+    if (!s_menu_px) {
+        s_menu_px = (uint8_t *)malloc((size_t)size);
+        if (!s_menu_px)
+            return;
+        s_menu_dirty = 1;
+    }
+    if (!s_menu_img) {
+        VkFormat fmt = menu_blit_format() ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+        /* SAMPLED too: make_image always builds the view, and a view needs
+         * the image to allow more than transfers. */
+        if (!make_image(MENU_PW, MENU_PH, fmt,
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &s_menu_img, &s_menu_view, &s_menu_mem))
+            return;
+        /* A fresh image starts UNDEFINED: take it to GENERAL once. */
+        memset(&ib, 0, sizeof ib);
+        ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        ib.srcAccessMask = 0;
+        ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib.image = s_menu_img;
+        ib.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ib.subresourceRange.layerCount = 1;
+        ib.subresourceRange.levelCount = 1;
+        vkCmdPipelineBarrier(s_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+        s_menu_dirty = 1;
+    }
+    if (s_menu_dirty) {
+        menu_build();
+        at = ring_alloc(size, 16, &staging);
+        if (!staging)
+            return;                 /* ring full mid-frame: skip this one */
+        memcpy(staging, s_menu_px, (size_t)size);
+        end_rendering();
+        barrier_all();
+        memset(&rg, 0, sizeof rg);
+        rg.bufferOffset = at;
+        rg.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rg.imageSubresource.layerCount = 1;
+        rg.imageExtent.width = MENU_PW;
+        rg.imageExtent.height = MENU_PH;
+        rg.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(s_cb, s_f->ring, s_menu_img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+        s_menu_dirty = 0;
+    }
+    if (dw + 48 > s_sc_extent.width || dh + 48 > s_sc_extent.height) {
+        double f = (double)(s_sc_extent.width - 48) / dw;
+        double g = (double)(s_sc_extent.height - 48) / dh;
+        if (g < f) f = g;
+        if (f < 0.25) f = 0.25;
+        dw = (uint32_t)(dw * f);
+        dh = (uint32_t)(dh * f);
+    }
+    memset(&bl, 0, sizeof bl);
+    bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bl.srcSubresource.layerCount = 1;
+    bl.srcOffsets[1].x = (int32_t)MENU_PW;
+    bl.srcOffsets[1].y = (int32_t)MENU_PH;
+    bl.srcOffsets[1].z = 1;
+    bl.dstSubresource = bl.srcSubresource;
+    bl.dstOffsets[0].x = 24;
+    bl.dstOffsets[0].y = 24;
+    bl.dstOffsets[1].x = 24 + (int32_t)dw;
+    bl.dstOffsets[1].y = 24 + (int32_t)dh;
+    bl.dstOffsets[1].z = 1;
+    end_rendering();
+    barrier_all();
+    vkCmdBlitImage(s_cb, s_menu_img, VK_IMAGE_LAYOUT_GENERAL, dst,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
 }
 #endif
 
@@ -3685,6 +4218,23 @@ static void vk_flip(void)
                 vkCmdBlitImage(s_cb, s->image, VK_IMAGE_LAYOUT_GENERAL, dst,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
             }
+#if !defined(__SWITCH__) && !defined(_WIN32)
+            {
+                /* RECOMP_MENU_OPEN=1 starts with the settings menu open, to
+                 * look at it without a keyboard plugged in. */
+                static int mo = -1;
+                if (mo < 0) {
+                    const char *e;
+                    mo = 0;
+                    e = getenv("RECOMP_MENU_OPEN");
+                    if (e && *e && *e != '0') {
+                        xbox_MenuToggle();
+                        fprintf(stderr, "  [MENU] opened at boot, open=%d\n", xbox_MenuOpen());
+                    }
+                }
+            }
+            menu_draw(dst);
+#endif
             b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             b.dstAccessMask = 0;
             b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;

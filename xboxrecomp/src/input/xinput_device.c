@@ -85,6 +85,12 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     WORD b = 0;
 
     memset(pState, 0, sizeof(*pState));
+    /* The packet number has to move for every answer: the title's input
+     * layer looks for button edges, so an unchanged number reads as the
+     * same state and a press is never noticed. */
+    pState->dwPacketNumber = ++packet;
+    if (xbox_MenuOpen())
+        return;                     /* F1 menu open: hold the pad still */
 
     if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
     if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
@@ -113,10 +119,6 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbLY = axis_from_keys(VK_NUMPAD2, VK_NUMPAD8);
     pState->Gamepad.sThumbRX = axis_from_keys('J', 'L');
     pState->Gamepad.sThumbRY = axis_from_keys('K', 'I');
-
-    /* The title's input layer looks for button edges, so the packet number
-     * has to move whenever the state does or a press is never noticed. */
-    pState->dwPacketNumber = ++packet;
 }
 
 /* The keyboard merged on top of whatever pad answered, rather than only
@@ -150,6 +152,22 @@ static void merge_keyboard(XBOX_INPUT_STATE *pState)
     /* The input layer records edges, so an unchanged packet number is read
      * as the same state and the press never happens. */
     pState->dwPacketNumber = kb.dwPacketNumber;
+}
+
+/* The F1 settings menu (drawn by the Vulkan renderer): while it is open the
+ * keyboard holds the pad still, so moving through the menu does not also
+ * drive the title. The flag lives here, next to the keyboard, so no
+ * renderer has to be linked for the input layer to ask it. */
+static int s_menu_open;
+
+int xbox_MenuOpen(void)
+{
+    return s_menu_open;
+}
+
+void xbox_MenuToggle(void)
+{
+    s_menu_open = !s_menu_open;
 }
 
 /* ======================================================================== */
@@ -285,6 +303,82 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ======================================================================== */
 
 #include <SDL.h>
+#include <stdio.h>
+#include "platform/xbox_cfg.h"
+
+/* Remapped keys (the F1 menu): per VK code a replacement SDL scancode, or
+ * -1 for the default table that keyboard_state() documents above. Stored as
+ * KB_<vk>=<sc> in the cfg file. */
+static int s_kb_sc[256];
+static unsigned char s_kb_touched[256];
+static int s_kb_inited;
+
+static void kb_init(void)
+{
+    int i;
+    if (s_kb_inited)
+        return;
+    s_kb_inited = 1;
+    for (i = 0; i < 256; i++)
+        s_kb_sc[i] = -1;
+}
+
+int xbox_KbOverrideGet(int vk)
+{
+    kb_init();
+    if (vk < 0 || vk > 255)
+        return -1;
+    return s_kb_sc[vk];
+}
+
+void xbox_KbOverrideSet(int vk, int scancode)
+{
+    kb_init();
+    if (vk < 0 || vk > 255)
+        return;
+    s_kb_sc[vk] = (scancode >= 0 && scancode < (int)SDL_NUM_SCANCODES) ? scancode : -1;
+    s_kb_touched[vk] = 1;
+}
+
+void xbox_KbOverrideClear(void)
+{
+    int i;
+    kb_init();
+    for (i = 0; i < 256; i++) {
+        s_kb_sc[i] = -1;
+        s_kb_touched[i] = 1;
+    }
+}
+
+void xbox_KbLoad(void)
+{
+    char v[16], key[16];
+    int vk;
+    kb_init();
+    for (vk = 0; vk < 256; vk++) {
+        int sc;
+        snprintf(key, sizeof key, "KB_%d", vk);
+        if (!xbox_CfgGet(key, v, sizeof v))
+            continue;
+        sc = atoi(v);
+        if (sc >= 0 && sc < (int)SDL_NUM_SCANCODES)
+            s_kb_sc[vk] = sc;
+    }
+}
+
+void xbox_KbSave(void)
+{
+    char key[16], v[16];
+    int vk;
+    kb_init();
+    /* -1 included: a reset must also erase a binding the file remembers. */
+    for (vk = 0; vk < 256; vk++)
+        if (s_kb_touched[vk]) {
+            snprintf(key, sizeof key, "KB_%d", vk);
+            snprintf(v, sizeof v, "%d", s_kb_sc[vk]);
+            xbox_CfgSet(key, v);
+        }
+}
 
 /* Where the keys come from on this side: the window's own event pump,
  * which records every key as it arrives (xbox_KeyState, called by the
@@ -319,6 +413,11 @@ int xbox_FramebufferKeyDown(int vk)
     int n = 0, i;
 
     k = (SDL_WasInit(0) != 0) ? SDL_GetKeyboardState(NULL) : NULL;
+    kb_init();
+    if (vk >= 0 && vk <= 255 && s_kb_sc[vk] >= 0) {
+        int o = s_kb_sc[vk];
+        return (s_key_down[o] || (k && k[o])) ? 1 : 0;
+    }
     switch (vk) {
     case VK_BACK:    sc[n++] = SDL_SCANCODE_BACKSPACE; break;
     case VK_RETURN:  sc[n++] = SDL_SCANCODE_RETURN; sc[n++] = SDL_SCANCODE_KP_ENTER; break;
@@ -371,6 +470,7 @@ void xbox_InputInit(void)
 {
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+    xbox_KbLoad();                  /* the F1 menu's remapped keys, if any */
     open_controllers();
 }
 

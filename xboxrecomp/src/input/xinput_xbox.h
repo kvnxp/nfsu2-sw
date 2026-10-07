@@ -109,6 +109,24 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
 
+/**
+ * The F1 settings menu: while open the keyboard holds the pad still.
+ */
+int  xbox_MenuOpen(void);
+void xbox_MenuToggle(void);
+
+/**
+ * Remapped keys (the F1 menu): per VK code a replacement SDL scancode,
+ * or -1 for the default table (arrows = d-pad, Enter = START, Z X A S =
+ * A B X Y, Q E = white/black, 1 3 = triggers, numpad 8 2 4 6 = left
+ * thumb, I K J L = right thumb). Stored as KB_<vk>=<sc> in the cfg file.
+ */
+int  xbox_KbOverrideGet(int vk);
+void xbox_KbOverrideSet(int vk, int scancode);
+void xbox_KbOverrideClear(void);
+void xbox_KbLoad(void);
+void xbox_KbSave(void);
+
 #ifdef __cplusplus
 }
 #endif
