@@ -73,23 +73,56 @@ NFSU2_XBE=/path/to/game/default.xbe NFSU2_GEN_DIR=/path/to/gen tools/regen.sh
 </details>
 
 <details open>
-<summary><b>2a. Linux</b> (SDL2 + OpenGL or Vulkan)</summary>
+<summary><b>2a. Linux</b> (SDL2, Vulkan or OpenGL)</summary>
 
 ```sh
-cmake -S . -B build -G Ninja -DNFSU2_GEN_DIR=/path/to/gen   # add -DNFSU2_VULKAN=ON for Vulkan
-cmake --build build
+platform/linux/build.sh          # BUILD_DIR, JOBS, VULKAN=0, FFMPEG_DIR
 NFSU2_GAME_DIR=/path/to/game build/nfsu2_recomp
 ```
 
 </details>
 
 <details open>
-<summary><b>2b. Nintendo Switch</b> (devkitA64, switch-sdl2, switch-mesa)</summary>
+<summary><b>2b. macOS</b> (Apple Silicon or Intel, Vulkan on MoltenVK)</summary>
+
+Needs:
+
+* Xcode Command Line Tools — `xcode-select --install`
+* [Homebrew](https://brew.sh), then:
+
+  ```sh
+  brew install cmake pkg-config molten-vk vulkan-loader sdl2 libepoxy \
+               openssl@3 glslang spirv-tools
+  ```
+
+  `libepoxy` and `pkg-config` are required even in the Vulkan build (the
+  D3D8 shim links epoxy), and glslang/spirv-tools compile the shaders the
+  title's vertex and fragment programs become. MoltenVK is the ICD that
+  actually draws; vulkan-loader is what the app and SDL load.
+* the lifted C of step 1 — `xboxrecomp/gen` by default, or `NFSU2_GEN_DIR`
+* optional, for the movies instead of the slow lifted VP6 decoder:
+  `tools/build_ffmpeg_vp6.sh mac`, then `FFMPEG_DIR`
 
 ```sh
-NFSU2_GEN_DIR=/path/to/gen NFSU2_GAME_SRC=/path/to/game switch/build.sh
+platform/macos/build.sh          # BUILD_DIR, JOBS, NFSU2_GEN_DIR, VULKAN=0, FFMPEG_DIR
+NFSU2_GAME_DIR=/path/to/game build/nfsu2_recomp
+# or nothing at all: a data/ directory (default.xbe, NFSUNDER/, B3/) next
+# to the executable
+```
+
+The renderer is Vulkan on MoltenVK. `VULKAN=0` builds the GL renderer,
+which has no window path on macOS yet: it leaves you with sound and no
+picture.
+
+</details>
+
+<details open>
+<summary><b>2c. Nintendo Switch</b> (devkitA64, switch-sdl2, switch-mesa)</summary>
+
+```sh
+NFSU2_GEN_DIR=/path/to/gen NFSU2_GAME_SRC=/path/to/game platform/switch/build.sh
 # Vulkan build (needs mesa-switch NVK and glslang for Switch)
-VULKAN=1 JOBS=6 NFSU2_GEN_DIR=/path/to/gen switch/build.sh
+VULKAN=1 JOBS=6 NFSU2_GEN_DIR=/path/to/gen NFSU2_GAME_SRC=/path/to/game platform/switch/build.sh
 ```
 
 </details>
@@ -104,7 +137,7 @@ VULKAN=1 JOBS=6 NFSU2_GEN_DIR=/path/to/gen switch/build.sh
 | `config/seed_functions.json` | entry points the static pass cannot see |
 | `xboxrecomp/` | the toolkit (MIT), vendored with this port's changes: NV2A renderers (Vulkan, OpenGL), SDL audio, Switch platform layer, translator fixes |
 | `tools/regen.sh` | XBE → lifted C (`gen/`, never committed) |
-| `switch/build.sh` | Switch NRO build + SD-card staging |
+| `platform/` | Per-platform build scripts: `platform/linux/build.sh`, `platform/macos/build.sh`, `platform/switch/build.sh` |
 
 ## ⚙️ Configuration
 
@@ -126,18 +159,18 @@ RECOMP_WIDESCREEN=0
 |---|---|
 | `XBOXRECOMP_DIR` | Toolkit to build or regenerate with (default: the vendored `xboxrecomp/`). |
 | `NFSU2_XBE` | `default.xbe` to lift (`tools/regen.sh`). |
-| `NFSU2_GEN_DIR` | Directory for the lifted C (default `/root/nfsu2x/gen`). |
+| `NFSU2_GEN_DIR` | Directory for the lifted C (`tools/regen.sh` writes `/root/nfsu2x/gen`; the platform scripts default to `<repo>/xboxrecomp/gen`). |
 | `LIFT_ONLY=1` | `regen.sh`: skip disasm / function id / ABI analysis and only re-lift (enough after translator or `recomp_manual.c` changes; seed changes need the full run). |
 | `RECOMP_LEAF_LOCALS=0` | Translator: keep MMX leaf-function registers in globals instead of C locals. |
 | `RECOMP_REG_LOCALS=0` | Translator: keep eax..edi/esp in globals instead of C locals. |
 | `RECOMP_X87_LOCALS=0` | Translator: keep the x87 stack top in its global instead of a local. |
-| `NFSU2_GAME_SRC` | `switch/build.sh`: extracted disc to stage (default `/root/nfsu2x/game`). |
-| `SD_ROOT` | `switch/build.sh`: staging SD-card root (default `<repo>/switch_sd`). |
-| `BUILD_DIR` | `switch/build.sh`: build directory (default `/root/nfsu2x/build-switch`, `-vk` with `VULKAN=1`). |
-| `JOBS` | `switch/build.sh`: parallel compile jobs (6 fits `-O2` in RAM). |
-| `VULKAN=1` | `switch/build.sh`: build the Vulkan renderer (`nfsu2x-vulkan.nro`). |
-| `NVK_SDK`, `GLSLANG_DIR` | `switch/build.sh` with `VULKAN=1`: mesa-switch NVK install and Switch glslang. |
-| `FFMPEG_DIR` | `switch/build.sh`: LGPL VP6-only FFmpeg for the movies (`tools/build_ffmpeg_vp6.sh`). |
+| `NFSU2_GAME_SRC` | `platform/switch/build.sh`: extracted disc to stage (default `/root/nfsu2x/game`). |
+| `SD_ROOT` | `platform/switch/build.sh`: staging SD-card root (default `<repo>/switch_sd`). |
+| `BUILD_DIR` | All three `platform/*/build.sh`: build directory (Switch `/root/nfsu2x/build-switch`, `-vk` with `VULKAN=1`; macOS and Linux `<repo>/build`). |
+| `JOBS` | All three `platform/*/build.sh`: parallel compile jobs (6 fits the Switch's `-O2` in RAM). |
+| `VULKAN` | All three `platform/*/build.sh`: `1` (the default) builds the Vulkan renderer, `0` the GL one — `nfsu2x-vulkan.nro` on the Switch, and on macOS the GL renderer has no window path yet. |
+| `NVK_SDK`, `GLSLANG_DIR` | `platform/switch/build.sh` with `VULKAN=1`: mesa-switch NVK install and Switch glslang. |
+| `FFMPEG_DIR` | All three `platform/*/build.sh`: LGPL VP6-only FFmpeg for the movies (`tools/build_ffmpeg_vp6.sh`). |
 
 </details>
 
@@ -146,7 +179,7 @@ RECOMP_WIDESCREEN=0
 
 | Variable | Meaning |
 |---|---|
-| `NFSU2_GAME_DIR` | Extracted disc (Linux; default `./game`). The Switch always uses `sdmc:/switch/nfsu2x/game/`. |
+| `NFSU2_GAME_DIR` | Where the extracted disc is at run time: this variable, else a `data/` directory next to the executable (`default.xbe`, `NFSUNDER/`, `B3/`), else `./game`. The Switch is always `sdmc:/switch/nfsu2x/game/`. |
 | `NFSU2_GL=0` | Use the executor's CPU renderer instead of the GPU renderer. |
 | `NFSU2_APU=0` | With `RECOMP_AC97_READY=plain`: no emulated APU (no sound). |
 | `NFSU2_SIM_STEPS` | Longest game-time step per frame, in 1/60 s (default 6 = 100 ms; 3 = the original 50 ms cap, which slows races below 20 fps). |
