@@ -11,20 +11,60 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CFG_PATH "nfsu2.cfg"
+#define CFG_NAME "nfsu2.cfg"
 #define CFG_MAX_LINES 64
 #define CFG_MAX_LEN 128
 
 static char   s_lines[CFG_MAX_LINES][CFG_MAX_LEN];
 static int    s_nlines;
 static int    s_inited;
+static char   s_dir[4096];          /* game dir; empty = working directory */
+static int    s_warned;
+
+static void cfg_path(char *out, size_t cap)
+{
+    if (s_dir[0])
+        snprintf(out, cap, "%s/%s", s_dir, CFG_NAME);
+    else
+        snprintf(out, cap, "%s", CFG_NAME);
+}
+
+void xbox_CfgSetDir(const char *dir)
+{
+    size_t n;
+    char tmp[4096];
+    if (!dir || !dir[0])
+        return;
+    snprintf(tmp, sizeof tmp, "%s", dir);
+    /* No trailing separator ("C:\\" keeps its own, "/" stays "/"). */
+    n = strlen(tmp);
+    while (n > 1 && (tmp[n - 1] == '/' || tmp[n - 1] == '\\'))
+        tmp[--n] = 0;
+    if (s_inited && !strcmp(s_dir, tmp))
+        return;                         /* same one: keep what is loaded */
+    memcpy(s_dir, tmp, n + 1);
+    /* A different directory than the one already loaded: start over, so a
+     * file found earlier somewhere else does not shadow the real one. */
+    if (s_inited) {
+        s_inited = 0;
+        s_nlines = 0;
+    }
+}
 
 static void cfg_save(void)
 {
-    FILE *f = fopen(CFG_PATH, "wb");
+    char path[4352];
+    FILE *f;
     int i;
-    if (!f)
+    cfg_path(path, sizeof path);
+    f = fopen(path, "wb");
+    if (!f) {
+        if (!s_warned++) {
+            s_warned = 1;
+            fprintf(stderr, "[CFG] cannot write %s\n", path);
+        }
         return;
+    }
     fprintf(f, "# written by the F1 menu; KEY=value, '#' starts a comment\n");
     for (i = 0; i < s_nlines; i++)
         fprintf(f, "%s\n", s_lines[i]);
@@ -35,12 +75,14 @@ void xbox_CfgInit(void)
 {
     FILE *f;
     char line[CFG_MAX_LEN];
+    char path[4352];
 
     if (s_inited)
         return;
     s_inited = 1;
     s_nlines = 0;
-    f = fopen(CFG_PATH, "rb");
+    cfg_path(path, sizeof path);
+    f = fopen(path, "rb");
     if (!f)
         return;
     while (s_nlines < CFG_MAX_LINES && fgets(line, sizeof line, f)) {
