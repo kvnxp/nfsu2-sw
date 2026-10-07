@@ -100,8 +100,9 @@ one):
 x1/x2/x3 applied live, vsync), **KEYBOARD** (every action remappable with
 Enter — twice for a stick axis — and a reset), **AUDIO** (volume 0..100).
 Arrows move and adjust, Enter activates, Esc closes. Everything is kept in
-`nfsu2.cfg` next to the working directory (`SCALE`, `VSYNC`, `VOLUME`,
-`KB_*`), so it survives restarts; the environment still wins over the file.
+`nfsu2.cfg` in the game directory, next to `UDATA` where the saves are
+(`SCALE`, `VSYNC`, `VOLUME`, `KB_*`), so it survives restarts; the
+environment still wins over the file.
 `RECOMP_KEY_TRACE=1` logs every key as it arrives — the useful first check
 when a key seems dead: the window has to have the focus.
 

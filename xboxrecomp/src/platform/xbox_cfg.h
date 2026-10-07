@@ -15,6 +15,11 @@ void xbox_CfgInit(void);
 int  xbox_CfgGet(const char *key, char *out, size_t cap);
 void xbox_CfgSet(const char *key, const char *value);
 
+/* Where nfsu2.cfg lives: the game directory (next to UDATA, where the
+ * saves are), set once it is known. Before that -- and when nobody sets
+ * it -- the working directory, as before. */
+void xbox_CfgSetDir(const char *dir);
+
 #ifdef __cplusplus
 }
 #endif

@@ -69,6 +69,7 @@ static void apu_mmio_wr(void *opaque, uint32_t off, uint32_t val, unsigned size)
 extern void xbe_entry_point(void);
 extern int recomp_dispatch_init(void);
 extern void xbox_path_init(const char *game_dir, const char *save_dir);
+extern void xbox_CfgSetDir(const char *dir);
 
 #define NFSU2_ENTRY_POINT 0x0021B1CEu
 
@@ -394,6 +395,18 @@ int main(int argc, char **argv)
 
     (void)argc;
     (void)argv;
+#if !defined(__SWITCH__)
+    /* The settings file's directory has to be known before the renderer
+     * reads it (SCALE/VSYNC at ready()); game_main() resolves and sets the
+     * same directory again on its worker, which answers identically. */
+    {
+        static char earlydir[4200];
+        const char *gd = getenv("NFSU2_GAME_DIR");
+        if (!gd || !gd[0])
+            gd = resolve_game_dir(earlydir, sizeof earlydir);
+        xbox_CfgSetDir(gd);
+    }
+#endif
 #if defined(NFSU2_VULKAN)
     {
         const char *gl = getenv("NFSU2_GL");
@@ -465,6 +478,9 @@ static int game_main(void)
         game_dir = NFSU2_DEFAULT_GAME_DIR;
 #endif
     }
+    /* The F1 menu's settings file lives with the game (next to UDATA,
+     * where the saves are); everyone reads it through xbox_CfgGet. */
+    xbox_CfgSetDir(game_dir);
     snprintf(xbe_path, sizeof(xbe_path), "%s/default.xbe", game_dir);
 
     xbe_data = load_file(xbe_path, &xbe_size);
