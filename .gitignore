@@ -64,3 +64,14 @@ gen/
 # Per-game toolkit output (disassembly of the retail XBE)
 xboxrecomp/tools/*/output/
 *.log
+
+# Local run junk: renderer caches, vulkaninfo dumps, the F1 menu's own
+# settings file, editor backups. Never upload any of these.
+progcache.bin
+vkpipecache.bin
+vkpipes.bin
+vkspirv.bin
+VP_VULKANINFO_*.json
+nfsu2.cfg
+*.bak
+*.backup*
