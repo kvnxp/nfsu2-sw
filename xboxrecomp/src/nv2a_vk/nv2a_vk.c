@@ -356,6 +356,17 @@ static void end_rendering(void)
 
 static VkRect2D s_sc_cur;               /* scissor set in this pass */
 
+/* Clear-rect padding in stored pixels: with the nv2a_snap offset at 0
+ * (see vb->surf[3]) geometry lands exactly on the title clip rects, but a
+ * full-screen pass still starts at the snapped 0.5 title px and never
+ * touches stored row/column 0 at scale > 1. Widening the clear by a pixel
+ * paints those with fresh clear colour instead of stale content (the
+ * glow-accumulator bug family). At k == 1 the pad is 0. */
+static uint32_t s_rect_pad(void)
+{
+    return s_scale > 1.0 ? 1u : 0u;
+}
+
 static void set_viewport(uint32_t pw, uint32_t ph)
 {
     VkViewport vp = { 0, 0, (float)pw, (float)ph, 0.0f, 1.0f };
@@ -365,26 +376,13 @@ static void set_viewport(uint32_t pw, uint32_t ph)
     s_sc_cur = sc;
 }
 
-/* Stored-pixel padding applied around every scissor/clear rectangle to
- * absorb the nv2a_snap vertex offset (u_surf.w) at scale > 1. The offset
- * moves all geometry up/left by ceil(0.5*k - 0.5) stored pixels, so the
- * geometry falls that far short of each rect's right/bottom edge, exposing
- * stale content (the glow-accumulator bug family: light lines at top/left,
- * stale interior columns/rows at k > 1). Expanding each rect outward by
- * that amount lets the neighbour tile's geometry (scissor) or the clear
- * colour (clear) cover the strip. At k == 1 the pad is 0 and behaviour is
- * unchanged. */
-static uint32_t s_rect_pad(void)
-{
-    double d = 0.5 * s_scale - 0.5 - 1e-9;
-    return d > 0.0 ? (uint32_t)ceil(d) : 0u;
-}
-
 /* SET_SURFACE_CLIP as the scissor, in s's stored pixels. NFSU2's split
  * screen draws each player's world with the clip set to that player's
  * half; the vertex programs place it there but do not stop at the edge.
  * Same as nv2a_gl.c (and xemu). Call inside the pass (begin_rendering
- * resets it to the whole surface). */
+ * resets it to the whole surface). The scissor is NOT expanded: with the
+ * snap offset at 0 below, geometry lands exactly on its edges, and
+ * widening it would double-draw the seam under additive blending. */
 static void set_surface_scissor(const uint32_t *r, const VkSurf *s)
 {
     uint32_t x0 = (r[0x200 / 4] & 0xFFFF) * s->aa_sx, x1 = x0 + (r[0x200 / 4] >> 16) * s->aa_sx;
@@ -394,19 +392,10 @@ static void set_surface_scissor(const uint32_t *r, const VkSurf *s)
     if (x1 > s->w) x1 = s->w;
     if (y1 > s->h) y1 = s->h;
     if (x1 > x0 && y1 > y0) {
-        uint32_t pad = s_rect_pad();
-        int32_t ox0 = (int32_t)to_stored(x0, s->pw, s->w) - (int32_t)pad;
-        int32_t oy0 = (int32_t)to_stored(y0, s->ph, s->h) - (int32_t)pad;
-        int32_t ox1 = (int32_t)to_stored(x1, s->pw, s->w) + (int32_t)pad;
-        int32_t oy1 = (int32_t)to_stored(y1, s->ph, s->h) + (int32_t)pad;
-        if (ox0 < 0) ox0 = 0;
-        if (oy0 < 0) oy0 = 0;
-        if ((uint32_t)ox1 > s->pw) ox1 = (int32_t)s->pw;
-        if ((uint32_t)oy1 > s->ph) oy1 = (int32_t)s->ph;
-        sc.offset.x = ox0;
-        sc.offset.y = oy0;
-        sc.extent.width = (uint32_t)(ox1 - ox0);
-        sc.extent.height = (uint32_t)(oy1 - oy0);
+        sc.offset.x = (int32_t)to_stored(x0, s->pw, s->w);
+        sc.offset.y = (int32_t)to_stored(y0, s->ph, s->h);
+        sc.extent.width = to_stored(x1, s->pw, s->w) - (uint32_t)sc.offset.x;
+        sc.extent.height = to_stored(y1, s->ph, s->h) - (uint32_t)sc.offset.y;
     }
     if (memcmp(&sc, &s_sc_cur, sizeof sc)) {
         vkCmdSetScissor(s_cb, 0, 1, &sc);
@@ -3403,7 +3392,14 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         vb->surf[0] = 2.0f / (float)s->w;
         vb->surf[1] = 2.0f / (float)s->h;
         vb->surf[2] = 1.0f / (float)zmax_of(r);
-        vb->surf[3] = 0.5f - 0.5f * (float)s->w / (float)s->pw; /* see nv2a_snap */
+        /* No snap offset (see nv2a_snap): shifting every vertex by
+         * (0.5 - 0.5/k) title pixels at scale k > 1 misaligns geometry
+         * with the CPU scissor/clear rects, leaving 1-px strips of stale
+         * content at every interior rect edge (magenta grid lines from
+         * the glow accumulator at x2/x3). The unshifted snap keeps
+         * geometry exactly on the rects; row/column 0 stays covered by
+         * the (padded) clear instead. */
+        vb->surf[3] = 0.0f;
         memcpy(vb->m, b->composite, sizeof vb->m);
         memcpy(vb->vpoff, b->vp_offset, sizeof vb->vpoff);
         vb->aa[0] = b->aa_sx > 0 ? b->aa_sx : 1.0f;
