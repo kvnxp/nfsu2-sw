@@ -3713,7 +3713,7 @@ void xbox_KbSave(void);
  * replaces, it does not blend, so the panel has its own background). */
 
 /* 5 bytes per glyph, bit 0 = top row. */
-static const char s_font_chars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:-/.()+%_?";
+static const char s_font_chars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:-/.()+%_?[]*";
 static const uint8_t s_font_data[][5] = {
     {0x00,0x00,0x00,0x00,0x00}, {0x7e,0x11,0x11,0x11,0x7e}, {0x7f,0x49,0x49,0x49,0x36},
     {0x3e,0x41,0x41,0x41,0x22}, {0x7f,0x41,0x41,0x22,0x1c}, {0x7f,0x49,0x49,0x49,0x41},
@@ -3731,6 +3731,8 @@ static const uint8_t s_font_data[][5] = {
     {0x20,0x10,0x08,0x04,0x02}, {0x00,0x60,0x60,0x00,0x00}, {0x00,0x1c,0x22,0x41,0x00},
     {0x00,0x41,0x22,0x1c,0x00}, {0x08,0x08,0x3e,0x08,0x08}, {0x62,0x64,0x08,0x13,0x23},
     {0x40,0x40,0x40,0x40,0x40}, {0x02,0x01,0x51,0x09,0x06},
+    /* '[', ']' and '*' (the remap marker used to fall back to '?'). */
+    {0x00,0x1F,0x11,0x11,0x00}, {0x00,0x11,0x11,0x1F,0x00}, {0x08,0x1C,0x3E,0x1C,0x08},
 };
 
 static const uint8_t *font_get(char c)
@@ -3911,12 +3913,30 @@ static void menu_value(const MenuRow *r, char *out, size_t cap)
     }
 }
 
-static void menu_text(uint32_t x, uint32_t y, const char *s, int inv)
+/* Menu text styles: normal labels, inverted selection, NFSU2-green
+ * accents (title, active tab, values) and dim hints. */
+enum { MS_NORMAL, MS_INVERT, MS_ACCENT, MS_DIM };
+static void menu_text_s(uint32_t x, uint32_t y, const char *s, int style)
 {
     /* x, y in character cells (12x16 px each). Alpha stays 255. */
     uint32_t cx = x * 12, cy = y * 16;
     const uint8_t *g;
     int xi, yi;
+    uint8_t fr, fg, fb, br, bg, bb;
+    switch (style) {
+    case MS_INVERT:
+        fr = fg = 10; fb = 22; br = bg = bb = 255;
+        break;
+    case MS_ACCENT:
+        fr = 170; fg = 255; fb = 120; br = bg = 10; bb = 22;
+        break;
+    case MS_DIM:
+        fr = fg = 130; fb = 150; br = bg = 10; bb = 22;
+        break;
+    default:
+        fr = fg = fb = 255; br = bg = 10; bb = 22;
+        break;
+    }
     for (; *s && cx + 12 <= MENU_PW; s++, cx += 12) {
         char c = *s;
         uint32_t ox, oy;
@@ -3927,7 +3947,7 @@ static void menu_text(uint32_t x, uint32_t y, const char *s, int inv)
         for (xi = 0; xi < 5; xi++) {
             for (yi = 0; yi < 7; yi++) {
                 int bit = (g[xi] >> yi) & 1;
-                if (bit ^ inv) { r = gg = b = 255; } else { r = gg = 10; b = 22; }
+                if (bit) { r = fr; gg = fg; b = fb; } else { r = br; gg = bg; b = bb; }
                 ox = cx + (uint32_t)xi * 2;
                 oy = cy + (uint32_t)yi * 2;
                 p = &s_menu_px[(oy * MENU_PW + ox) * 4];         p[0] = r; p[1] = gg; p[2] = b;
@@ -3938,7 +3958,6 @@ static void menu_text(uint32_t x, uint32_t y, const char *s, int inv)
         }
     }
 }
-
 static void menu_build(void)
 {
     uint8_t dark[4] = { 10, 10, 22, 255 }, lite[4] = { 255, 255, 255, 255 };
@@ -3948,20 +3967,39 @@ static void menu_build(void)
         for (px = 0; px < (int)MENU_PW; px++)
             memcpy(&s_menu_px[(py * MENU_PW + px) * 4],
                    (px < 2 || py < 2 || px >= (int)MENU_PW - 2 || py >= (int)MENU_PH - 2) ? lite : dark, 4);
-    menu_text(1, 0, "SETTINGS - F1 CLOSES", 0);
-    /* Tab bar: one cell per section, active tab inverted. */
+    menu_text_s(1, 0, "SETTINGS - F1 CLOSES", MS_ACCENT);
+    /* Tab bar: the active tab in brackets and accent, the rest dim. */
     for (t = 0, i = 0; i < (int)MENU_NROWS; i++) {
         if (s_menu_rows[i].kind != MK_HEAD)
             continue;
-        menu_text((uint32_t)tx, 1, s_menu_rows[i].label, t == s_menu_tab ? 1 : 0);
-        tx += (int)strlen(s_menu_rows[i].label) + 3;
+        if (t == s_menu_tab) {
+            char tok[32];
+            snprintf(tok, sizeof tok, "[%s]", s_menu_rows[i].label);
+            menu_text_s((uint32_t)tx, 1, tok, MS_ACCENT);
+            tx += (int)strlen(tok) + 2;
+        } else {
+            menu_text_s((uint32_t)tx, 1, s_menu_rows[i].label, MS_DIM);
+            tx += (int)strlen(s_menu_rows[i].label) + 2;
+        }
         t++;
     }
-    /* Only the active tab's rows. */
+    /* Separator rule under the tabs. */
+    {
+        char sep[52];
+        memset(sep, '-', sizeof sep - 1);
+        sep[sizeof sep - 1] = 0;
+        menu_text_s(1, 2, sep, MS_DIM);
+    }
+    /* Only the active tab's rows; the value column goes in accent so the
+     * eye finds the settings at a glance. The selected row is accent text
+     * on the dark background, never an inverted (white) block: the menu
+     * bitmap is bilinearly upscaled to the window and bright backgrounds
+     * smear dark glyphs into mush. */
     menu_tab_range(s_menu_tab, &start, &end);
     for (i = start; i < end; i++) {
         const MenuRow *r = &s_menu_rows[i];
         char line[64], v[32];
+        int sel = (i == s_menu_sel);
         if (r->kind == MK_HEAD) {
             continue;
         } else {
@@ -3972,16 +4010,16 @@ static void menu_build(void)
             while (n < 34 && n < (int)sizeof line - 1)
                 line[n++] = '.';
             line[n] = 0;
-            snprintf(line + n, sizeof line - (size_t)n, " %s", v);
+            menu_text_s(1, (uint32_t)(li + 3), line, sel ? MS_ACCENT : MS_NORMAL);
+            menu_text_s(36, (uint32_t)(li + 3), v, MS_ACCENT);
         }
-        menu_text(1, (uint32_t)(li + 3), line, i == s_menu_sel ? 1 : 0);
         li++;
     }
     if (s_menu_cap)
-        menu_text(1, (uint32_t)(li + 3), "PRESS A KEY (ESC CANCELS)", 0);
+        menu_text_s(1, (uint32_t)(li + 3), "PRESS A KEY (ESC CANCELS)", MS_ACCENT);
     else {
-        menu_text(1, (uint32_t)(li + 3), "ARROWS MOVE ENTER SELECT TAB SECTION", 0);
-        menu_text(1, (uint32_t)(li + 4), "LEFT RIGHT ADJUST ESC QUIT", 0);
+        menu_text_s(1, (uint32_t)(li + 3), "ARROWS MOVE ENTER SELECT TAB SECTION", MS_DIM);
+        menu_text_s(1, (uint32_t)(li + 4), "LEFT RIGHT ADJUST ESC QUIT", MS_DIM);
     }
 }
 
