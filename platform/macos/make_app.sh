@@ -32,6 +32,9 @@
 #   APP         output bundle (default $BUILD_DIR/NFSU2.app)
 #   RECOPY=1    with GAME_DIR: discard the previous bundle copy, copy again
 #   NO_BUILD=1  package the binary as it is, skip platform/macos/build.sh
+#   ARCH        passed through to build.sh (arm64/x86_64, default native):
+#               run natively on each machine; the bundled dylibs must match
+#               the binary's architecture (checked before signing).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -39,6 +42,10 @@ BUILD="${BUILD_DIR:-$REPO/build}"
 BIN="$BUILD/nfsu2_recomp"
 APP="${APP:-$BUILD/NFSU2.app}"
 HPREFIX="${HOMEBREW_PREFIX:-$(brew --prefix 2>/dev/null || echo /opt/homebrew)}"
+if [ "$HPREFIX" = "/opt/homebrew" ] && [ "$(uname -m 2>/dev/null)" != "arm64" ] && ! [ -d /opt/homebrew ]; then
+    # Intel Mac without brew in PATH: Homebrew lives in /usr/local there.
+    HPREFIX=/usr/local
+fi
 
 fail() { echo "error: $*" >&2; exit 1; }
 
@@ -276,6 +283,18 @@ if [ -f "$SRC_ICON" ]; then
     iconutil -c icns "$SET" -o "$RES/AppIcon.icns"
     rm -rf "$SET"
 fi
+
+# Every bundled image must contain the binary's architecture (e.g. an
+# arm64-only Homebrew cannot feed an x86_64 bundle: build natively instead).
+want="$(lipo -archs "$MACOS/nfsu2_recomp" 2>/dev/null | tr ' ' '\n' | head -1)"
+for f in "$FW"/*.dylib; do
+    have="$(lipo -archs "$f" 2>/dev/null || true)"
+    case " $have " in
+        *" $want "*) ;;
+        *) fail "$f has [$have] but the app is [$want] -- install matching-arch Homebrew bottles (no cross-arch mixing)" ;;
+    esac
+done
+[ -n "$want" ] && echo "arch: $want ($(ls "$FW"/*.dylib | wc -l | tr -d ' ') bundled dylibs)"
 
 # Ad-hoc signature: arm64 refuses unsigned code, and install_name_tool broke
 # whatever the linker and Homebrew had signed.

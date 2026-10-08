@@ -24,6 +24,14 @@
 #   BUILD_DIR       default <repo>/build
 #   JOBS            parallel compile jobs (default: hw.ncpu)
 #   NFSU2_GEN_DIR   lifted C from tools/regen.sh (default <repo>/xboxrecomp/gen)
+#   ARCH            target architecture: arm64 or x86_64
+#                   (default: the machine's own, so Intel Macs build Intel
+#                   binaries with their /usr/local Homebrew and Apple
+#                   Silicon builds arm64 with /opt/homebrew -- just run it).
+#                   Cross-compiling (e.g. ARCH=x86_64 on Apple Silicon)
+#                   needs matching-arch Homebrew bottles, which a stock
+#                   single-arch Homebrew does not provide; prefer a native
+#                   build on each machine.
 #   VULKAN          1 (default) Vulkan on MoltenVK. 0 builds the GL renderer,
 #                   which has no window path on macOS yet: it would hit the
 #                   same Cocoa main-thread rule that used to leave the Vulkan
@@ -39,6 +47,12 @@ BUILD="${BUILD_DIR:-$REPO/build}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 VK="${VULKAN:-1}"
 GEN="${NFSU2_GEN_DIR:-$REPO/xboxrecomp/gen}"
+# Native architecture by default (arm64 on Apple Silicon, x86_64 on Intel).
+case "${ARCH:-$(uname -m 2>/dev/null)}" in
+    arm64|aarch64)  ARCH=arm64 ;;
+    x86_64|amd64)   ARCH=x86_64 ;;
+    *)              ARCH="" ;;  # unknown: let the compiler default decide
+esac
 
 fail() { echo "error: $*" >&2; exit 1; }
 
@@ -87,8 +101,14 @@ else
     echo "         (tools/build_ffmpeg_vp6.sh mac)" >&2
 fi
 
+ARCH_ARGS=()
+if [ -n "$ARCH" ]; then
+    ARCH_ARGS=(-DCMAKE_OSX_ARCHITECTURES="$ARCH")
+    echo "target architecture: $ARCH"
+fi
+
 cmake -S "$REPO" -B "$BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-    -DNFSU2_GEN_DIR="$GEN" "${VK_ARGS[@]}" "${FF_ARGS[@]}"
+    -DNFSU2_GEN_DIR="$GEN" "${ARCH_ARGS[@]}" "${VK_ARGS[@]}" "${FF_ARGS[@]}"
 cmake --build "$BUILD" -j"$JOBS"
 
 echo
