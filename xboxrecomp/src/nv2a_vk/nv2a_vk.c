@@ -358,6 +358,21 @@ static void set_viewport(uint32_t pw, uint32_t ph)
     s_sc_cur = sc;
 }
 
+/* Stored-pixel padding applied around every scissor/clear rectangle to
+ * absorb the nv2a_snap vertex offset (u_surf.w) at scale > 1. The offset
+ * moves all geometry up/left by ceil(0.5*k - 0.5) stored pixels, so the
+ * geometry falls that far short of each rect's right/bottom edge, exposing
+ * stale content (the glow-accumulator bug family: light lines at top/left,
+ * stale interior columns/rows at k > 1). Expanding each rect outward by
+ * that amount lets the neighbour tile's geometry (scissor) or the clear
+ * colour (clear) cover the strip. At k == 1 the pad is 0 and behaviour is
+ * unchanged. */
+static uint32_t s_rect_pad(void)
+{
+    double d = 0.5 * s_scale - 0.5 - 1e-9;
+    return d > 0.0 ? (uint32_t)ceil(d) : 0u;
+}
+
 /* SET_SURFACE_CLIP as the scissor, in s's stored pixels. NFSU2's split
  * screen draws each player's world with the clip set to that player's
  * half; the vertex programs place it there but do not stop at the edge.
@@ -372,10 +387,19 @@ static void set_surface_scissor(const uint32_t *r, const VkSurf *s)
     if (x1 > s->w) x1 = s->w;
     if (y1 > s->h) y1 = s->h;
     if (x1 > x0 && y1 > y0) {
-        sc.offset.x = (int32_t)to_stored(x0, s->pw, s->w);
-        sc.offset.y = (int32_t)to_stored(y0, s->ph, s->h);
-        sc.extent.width = to_stored(x1, s->pw, s->w) - (uint32_t)sc.offset.x;
-        sc.extent.height = to_stored(y1, s->ph, s->h) - (uint32_t)sc.offset.y;
+        uint32_t pad = s_rect_pad();
+        int32_t ox0 = (int32_t)to_stored(x0, s->pw, s->w) - (int32_t)pad;
+        int32_t oy0 = (int32_t)to_stored(y0, s->ph, s->h) - (int32_t)pad;
+        int32_t ox1 = (int32_t)to_stored(x1, s->pw, s->w) + (int32_t)pad;
+        int32_t oy1 = (int32_t)to_stored(y1, s->ph, s->h) + (int32_t)pad;
+        if (ox0 < 0) ox0 = 0;
+        if (oy0 < 0) oy0 = 0;
+        if ((uint32_t)ox1 > s->pw) ox1 = (int32_t)s->pw;
+        if ((uint32_t)oy1 > s->ph) oy1 = (int32_t)s->ph;
+        sc.offset.x = ox0;
+        sc.offset.y = oy0;
+        sc.extent.width = (uint32_t)(ox1 - ox0);
+        sc.extent.height = (uint32_t)(oy1 - oy0);
     }
     if (memcmp(&sc, &s_sc_cur, sizeof sc)) {
         vkCmdSetScissor(s_cb, 0, 1, &sc);
@@ -3446,14 +3470,22 @@ static void vk_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         uint32_t hz = s_regs[0x1D98 / 4], vt = s_regs[0x1D9C / 4];
         uint32_t x0 = (hz & 0xFFFF) * s->aa_sx, x1 = ((hz >> 16) + 1) * s->aa_sx;
         uint32_t y0 = (vt & 0xFFFF) * s->aa_sy, y1 = ((vt >> 16) + 1) * s->aa_sy;
+        uint32_t pad = s_rect_pad();
         if (x1 > s->w) x1 = s->w;
         if (y1 > s->h) y1 = s->h;
         if (x1 > x0 && y1 > y0) {
-            uint32_t px0 = to_stored(x0, s->pw, s->w), py0 = to_stored(y0, s->ph, s->h);
-            rect.rect.offset.x = (int32_t)px0;
-            rect.rect.offset.y = (int32_t)py0;
-            rect.rect.extent.width = to_stored(x1, s->pw, s->w) - px0;
-            rect.rect.extent.height = to_stored(y1, s->ph, s->h) - py0;
+            int32_t ox0 = (int32_t)to_stored(x0, s->pw, s->w) - (int32_t)pad;
+            int32_t oy0 = (int32_t)to_stored(y0, s->ph, s->h) - (int32_t)pad;
+            int32_t ox1 = (int32_t)to_stored(x1, s->pw, s->w) + (int32_t)pad;
+            int32_t oy1 = (int32_t)to_stored(y1, s->ph, s->h) + (int32_t)pad;
+            if (ox0 < 0) ox0 = 0;
+            if (oy0 < 0) oy0 = 0;
+            if ((uint32_t)ox1 > s->pw) ox1 = (int32_t)s->pw;
+            if ((uint32_t)oy1 > s->ph) oy1 = (int32_t)s->ph;
+            rect.rect.offset.x = ox0;
+            rect.rect.offset.y = oy0;
+            rect.rect.extent.width = (uint32_t)(ox1 - ox0);
+            rect.rect.extent.height = (uint32_t)(oy1 - oy0);
         }
     }
     if (d && rect.rect.extent.width > d->pw - (uint32_t)rect.rect.offset.x)
