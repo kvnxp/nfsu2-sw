@@ -8,7 +8,8 @@
  *
  * Game data is the extracted disc (default.xbe, NFSUNDER/, B3/). Where it is
  * looked for:
- *   Windows/Linux: $NFSU2_GAME_DIR, else ./game
+ *   Windows/Linux: $NFSU2_GAME_DIR, else game/ next to the executable,
+ *                   else ./game in the working directory
  *   Switch:        sdmc:/switch/nfsu2x/game
  */
 
@@ -18,6 +19,9 @@
 #else
 #  include <signal.h>
 #  include <unistd.h>
+#endif
+#if defined(__APPLE__) && !defined(__SWITCH__)
+#  include <mach-o/dyld.h>          /* _NSGetExecutablePath */
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,6 +69,7 @@ static void apu_mmio_wr(void *opaque, uint32_t off, uint32_t val, unsigned size)
 extern void xbe_entry_point(void);
 extern int recomp_dispatch_init(void);
 extern void xbox_path_init(const char *game_dir, const char *save_dir);
+extern void xbox_CfgSetDir(const char *dir);
 
 #define NFSU2_ENTRY_POINT 0x0021B1CEu
 
@@ -202,6 +207,75 @@ static void install_crash_reporter(void)
 
 /* ------------------------------------------------------------------ */
 
+#if !defined(__SWITCH__)
+/* A directory is the game data if it holds default.xbe. fopen rather than
+ * access(): that answer is the same on Windows and on sdmc. */
+static int has_game(const char *dir)
+{
+    char path[4200];
+    FILE *f;
+
+    if (snprintf(path, sizeof path, "%s/default.xbe", dir) >= (int)sizeof path)
+        return 0;
+    f = fopen(path, "rb");
+    if (!f)
+        return 0;
+    fclose(f);
+    return 1;
+}
+
+/* Where the game data is, without NFSU2_GAME_DIR: a game/ directory next to
+ * the executable first (so a build can be shipped with the disc beside it
+ * and nothing configured), then ./game in the working directory, which is
+ * the original default. $NFSU2_GAME_DIR always wins. */
+static const char *resolve_game_dir(char *buf, size_t cap)
+{
+    const char *env = getenv("NFSU2_GAME_DIR");
+    char exe[4096], dir[4096];
+    size_t i, len;
+
+    if (env && env[0])
+        return env;
+
+    exe[0] = 0;
+#if defined(_WIN32)
+    {
+        DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof exe);
+        if (!n || n >= sizeof exe)
+            exe[0] = 0;
+    }
+#elif defined(__APPLE__)
+    {
+        uint32_t sz = (uint32_t)sizeof exe;
+        if (_NSGetExecutablePath(exe, &sz) != 0)
+            exe[0] = 0;
+    }
+#elif defined(__linux__)
+    {
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        if (n > 0)
+            exe[n] = 0;
+        else
+            exe[0] = 0;
+    }
+#endif
+    /* The executable's directory, up to the last separator. */
+    len = strlen(exe);
+    for (i = len; i > 0; i--)
+        if (exe[i - 1] == '/' || exe[i - 1] == '\\')
+            break;
+    if (i > 0 && i < sizeof dir) {
+        memcpy(dir, exe, i);
+        dir[i] = 0;
+        if (i > 0 && (dir[i - 1] == '/' || dir[i - 1] == '\\'))
+            dir[--i] = 0;               /* "build/" -> "build", "/" -> "" */
+        if (snprintf(buf, cap, "%s/game", dir) < (int)cap && has_game(buf))
+            return buf;
+    }
+    return NFSU2_DEFAULT_GAME_DIR;          /* ./game in the working directory */
+}
+#endif
+
 static void *load_file(const char *path, size_t *out_size)
 {
     FILE *f = fopen(path, "rb");
@@ -281,12 +355,81 @@ int main(int argc, char **argv)
     switch_shutdown();
     return rc;
 }
-#else
+#elif !defined(__APPLE__)
 int main(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
     return game_main();
+}
+#endif
+
+#if defined(__APPLE__) && !defined(__SWITCH__)
+#include <pthread.h>
+#include <unistd.h>
+/* Cocoa belongs to the process' main thread: the SDL window has to be
+ * created there, events have to be pumped there (the executor thread would
+ * otherwise own NSApp), and without that pump the layer never shows a
+ * frame -- which is how a port ends up with sound but a black screen. So
+ * the title runs on a worker with a desktop-sized stack and main drives
+ * SDL. The renderer is built on main before the title starts: ready() is
+ * lazy everywhere else and would land on the executor thread. */
+static volatile int s_game_done;
+static int s_game_rc;
+
+static void *game_thread(void *arg)
+{
+    (void)arg;
+    s_game_rc = game_main();
+    s_game_done = 1;
+    return NULL;
+}
+
+int main(int argc, char **argv)
+{
+    pthread_attr_t attr;
+    pthread_t th;
+#if defined(NFSU2_VULKAN)
+    void nv2a_vk_pump(void);
+#endif
+
+    (void)argc;
+    (void)argv;
+#if !defined(__SWITCH__)
+    /* The settings file's directory has to be known before the renderer
+     * reads it (SCALE/VSYNC at ready()); game_main() resolves and sets the
+     * same directory again on its worker, which answers identically. */
+    {
+        static char earlydir[4200];
+        const char *gd = getenv("NFSU2_GAME_DIR");
+        if (!gd || !gd[0])
+            gd = resolve_game_dir(earlydir, sizeof earlydir);
+        xbox_CfgSetDir(gd);
+    }
+#endif
+#if defined(NFSU2_VULKAN)
+    {
+        const char *gl = getenv("NFSU2_GL");
+        if (!gl || strcmp(gl, "0") != 0) {
+            int nv2a_vk_ready(void);
+            nv2a_vk_ready();            /* window + device, on this thread */
+        }
+    }
+#endif
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16u * 1024 * 1024);
+    if (pthread_create(&th, &attr, game_thread, NULL) != 0) {
+        fprintf(stderr, "[FATAL] cannot start the game thread\n");
+        return 1;
+    }
+    while (!s_game_done) {
+#if defined(NFSU2_VULKAN)
+        nv2a_vk_pump();
+#endif
+        usleep(2000);
+    }
+    pthread_join(th, NULL);
+    return s_game_rc;
 }
 #endif
 
@@ -327,15 +470,25 @@ static int game_main(void)
 #endif
 
     game_dir = getenv("NFSU2_GAME_DIR");
-    if (!game_dir || !game_dir[0])
+    if (!game_dir || !game_dir[0]) {
+#if !defined(__SWITCH__)
+        static char gamedir[4200];      /* kept: game_dir points into it */
+        game_dir = resolve_game_dir(gamedir, sizeof gamedir);
+#else
         game_dir = NFSU2_DEFAULT_GAME_DIR;
+#endif
+    }
+    /* The F1 menu's settings file lives with the game (next to UDATA,
+     * where the saves are); everyone reads it through xbox_CfgGet. */
+    xbox_CfgSetDir(game_dir);
     snprintf(xbe_path, sizeof(xbe_path), "%s/default.xbe", game_dir);
 
     xbe_data = load_file(xbe_path, &xbe_size);
     if (!xbe_data) {
         fprintf(stderr, "cannot read %s\n", xbe_path);
-        fatal("Failed to load default.xbe. Put the extracted disc in the game "
-              "directory (or set NFSU2_GAME_DIR).");
+        fatal("Failed to load default.xbe. Put the extracted disc in a "
+              "game directory next to the executable (or in the working "
+              "directory), or set NFSU2_GAME_DIR.");
         return 1;
     }
     printf("XBE %s: %zu bytes\n", xbe_path, xbe_size);

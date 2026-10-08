@@ -17,8 +17,12 @@
  *              SPIR-V at run time by glslang, cached by what generated them.
  *   pipelines  keyed by the shader pair, blend state, colour mask, whether
  *              there is a depth buffer and the topology class; everything
- *              else (depth, stencil, cull, winding, topology, vertex layout,
- *              viewport) is dynamic state.
+ *              else (depth, stencil, cull, winding, topology, viewport) is
+ *              dynamic state. The vertex layout is dynamic state too, but
+ *              only where VK_EXT_vertex_input_dynamic_state exists (NVK,
+ *              lavapipe). MoltenVK has no such extension, so there the
+ *              layout is part of the key (PipeKey.vlay) and every draw
+ *              hands its layout to vlayout_of() before the pipeline.
  *   uniforms   two std140 blocks per draw in the frame ring, textures as
  *              combined image samplers, all through push descriptors.
  *
@@ -37,6 +41,7 @@
 #include "../nv2a_gl/gl_psh.h"
 #include "../nv2a_gl/gl_vsh.h"
 #include "../kernel/nv2a_backend.h"
+#include "../platform/xbox_cfg.h"       /* SCALE/VSYNC, before ready() */
 
 #if defined(__SWITCH__)
 #include <switch.h>
@@ -62,6 +67,12 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 static int s_state;            /* 0 untried, 1 ready, -1 failed */
 static int s_trace;
+/* The settings menu (below) applies these between frames. */
+static double s_scale = 1.0;
+static int    s_vsync = -1;     /* -1 auto (whatever the driver prefers), 0 off, 1 on (FIFO) */
+static int    s_sc_vsync;       /* whether the swapchain as built waits for vblank */
+static int    s_scale_pending, s_vsync_pending;
+static double s_scale_new = 1.0;
 /* RECOMP_VK_TRACE=<n>: name every step of the first n draws, clears and
  * flips (a crash inside the driver then ends the log at the step). */
 static int s_vtrace;
@@ -95,10 +106,21 @@ static VkPhysicalDeviceMemoryProperties s_memprops;
 static VkDeviceSize     s_ubo_align = 256;
 static uint32_t         s_ubo_range = 16384;
 static VkFormat         s_depth_fmt = VK_FORMAT_D24_UNORM_S8_UINT;
-static int              s_have_bc, s_have_depth_clamp;
+static int              s_have_bc, s_have_depth_clamp, s_have_aniso;
+static float            s_max_aniso = 1.0f;
+/* Anisotropic filtering level (0 off, else 2/4/8/16, clamped to the device
+ * limit): sharpens road and ground textures at grazing angles, the classic
+ * image-quality win for racing games. Env RECOMP_ANISO wins, else cfg
+ * ANISO, else off. Changing it only affects samplers created afterwards;
+ * the level is part of the sampler cache key, so old samplers age out. */
+static int              s_aniso = 0;
 
 static PFN_vkCmdPushDescriptorSetKHR  p_push_desc;
 static PFN_vkCmdSetVertexInputEXT     p_vertex_input;
+/* 1: VK_EXT_vertex_input_dynamic_state is enabled and upload_vertices sets
+ * the layout per draw. 0 (MoltenVK): every pipeline is built with the
+ * layout of the draw it was made for (PipeKey.vlay, s_vlay). */
+static int                            s_dyn_vi;
 static PFN_vkCmdBeginRendering        p_begin_rendering;
 static PFN_vkCmdEndRendering          p_end_rendering;
 static PFN_vkCmdSetCullMode           p_cull_mode;
@@ -118,6 +140,10 @@ static VkExtent2D     s_sc_extent;
 static uint32_t       s_sc_count;
 static VkImage        s_sc_images[8];
 static int            s_headless;
+/* Render-finished semaphores, one per swapchain image: a present waits on
+ * image i's, and only a later acquire of image i can re-signal it. One per
+ * frame would be re-signalled while a present still holds it. */
+static VkSemaphore    s_rend[8];
 #if !defined(__SWITCH__)
 static SDL_Window    *s_win;
 #endif
@@ -159,7 +185,7 @@ typedef struct {
     VkCommandPool   pool;
     VkCommandBuffer cb;
     VkFence         fence;
-    VkSemaphore     acquired, rendered;
+    VkSemaphore     acquired;
     VkBuffer        ring;
     VkDeviceMemory  ring_mem;
     uint8_t        *ring_ptr;
@@ -177,6 +203,8 @@ static uint32_t s_cb_gen;      /* bumped at every vkBeginCommandBuffer */
 static int s_dyn_valid;
 
 static void garbage_add_pipe(VkPipeline pipe);
+static int create_swapchain(void);
+static void renderer_reset_caches(void);
 static void garbage_add(VkImage img, VkImageView view, VkDeviceMemory mem)
 {
     Frame *f = s_f;
@@ -212,6 +240,19 @@ static void garbage_free(Frame *f)
 static void frame_begin(void)
 {
     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    /* The settings menu applies between frames, when this slot's commands
+     * are done: a vsync change rebuilds the swapchain, a scale change the
+     * cached surfaces and depth (their stored pixels are the old scale). */
+    if (s_vsync_pending) {
+        vkDeviceWaitIdle(s_dev);
+        create_swapchain();
+        s_vsync_pending = 0;
+    }
+    if (s_scale_pending) {
+        s_scale = s_scale_new;
+        s_scale_pending = 0;
+        renderer_reset_caches();
+    }
     s_f = &s_fr[s_fi];
     if (s_f->submitted) {
         vkWaitForFences(s_dev, 1, &s_f->fence, VK_TRUE, UINT64_MAX);
@@ -276,8 +317,8 @@ typedef struct {
 
 /* RECOMP_GL_SCALE, as in nv2a_gl: only the pixels behind a surface grow, so
  * the viewport, clear rectangles, read-backs and the present blit scale and
- * nothing else does. Capped per surface by the device's image limits. */
-static double   s_scale = 1.0;
+ * nothing else does. Capped per surface by the device's image limits.
+ * (s_scale itself is declared with the menu state at the top.) */
 static uint32_t s_max_size = 4096;
 
 /* v title pixels of a surface l wide, in the p stored pixels behind it. */
@@ -315,6 +356,17 @@ static void end_rendering(void)
 
 static VkRect2D s_sc_cur;               /* scissor set in this pass */
 
+/* Clear-rect padding in stored pixels: with the nv2a_snap offset at 0
+ * (see vb->surf[3]) geometry lands exactly on the title clip rects, but a
+ * full-screen pass still starts at the snapped 0.5 title px and never
+ * touches stored row/column 0 at scale > 1. Widening the clear by a pixel
+ * paints those with fresh clear colour instead of stale content (the
+ * glow-accumulator bug family). At k == 1 the pad is 0. */
+static uint32_t s_rect_pad(void)
+{
+    return s_scale > 1.0 ? 1u : 0u;
+}
+
 static void set_viewport(uint32_t pw, uint32_t ph)
 {
     VkViewport vp = { 0, 0, (float)pw, (float)ph, 0.0f, 1.0f };
@@ -328,7 +380,9 @@ static void set_viewport(uint32_t pw, uint32_t ph)
  * screen draws each player's world with the clip set to that player's
  * half; the vertex programs place it there but do not stop at the edge.
  * Same as nv2a_gl.c (and xemu). Call inside the pass (begin_rendering
- * resets it to the whole surface). */
+ * resets it to the whole surface). The scissor is NOT expanded: with the
+ * snap offset at 0 below, geometry lands exactly on its edges, and
+ * widening it would double-draw the seam under additive blending. */
 static void set_surface_scissor(const uint32_t *r, const VkSurf *s)
 {
     uint32_t x0 = (r[0x200 / 4] & 0xFFFF) * s->aa_sx, x1 = x0 + (r[0x200 / 4] >> 16) * s->aa_sx;
@@ -574,6 +628,31 @@ static VkDepthBuf *depth_get(uint32_t va, uint32_t pw, uint32_t ph)
 
 /* The target of a draw or clear: surface (created on first use) and the
  * depth buffer of its zeta address. */
+/* Drop every cached surface and depth buffer, for a render-scale change:
+ * their stored pixels are the old scale, so the next draw rebuilds each.
+ * Images are freed through the garbage two frames later, so a frame still
+ * flying keeps its own (vkCmdBindVertexBuffers-style handles, not the
+ * table, are what its commands reference). */
+static void renderer_reset_caches(void)
+{
+    uint32_t i;
+    for (i = 0; i < VK_MAX_SURF; i++) {
+        if (!s_surf[i].image)
+            continue;
+        if (s_rt == &s_surf[i]) { end_rendering(); s_rt = NULL; }
+        if (s_last == &s_surf[i]) s_last = NULL;
+        garbage_add(s_surf[i].image, s_surf[i].view, s_surf[i].mem);
+        memset(&s_surf[i], 0, sizeof s_surf[i]);
+    }
+    for (i = 0; i < VK_MAX_DEPTH; i++) {
+        if (!s_depth[i].image)
+            continue;
+        if (s_rt_depth == &s_depth[i]) s_rt_depth = NULL;
+        garbage_add(s_depth[i].image, s_depth[i].view, s_depth[i].mem);
+        memset(&s_depth[i], 0, sizeof s_depth[i]);
+    }
+}
+
 static VkSurf *target(const Nv2aSurface *sf, uint32_t zeta_va, VkDepthBuf **dout)
 {
     uint32_t bpp = sf->bytes_per_pixel ? sf->bytes_per_pixel : 4;
@@ -1025,6 +1104,12 @@ static VkSampler sampler_get(uint32_t key)
     ci.minFilter = (key & 0x20000) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     ci.maxLod = 0.0f;
+    if (s_have_aniso && s_aniso > 0) {
+        float a = (float)s_aniso;
+        if (a > s_max_aniso) a = s_max_aniso;
+        ci.anisotropyEnable = VK_TRUE;
+        ci.maxAnisotropy = a;
+    }
     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     if (s_nsamplers == 64)
         s_nsamplers = 0;                    /* never in practice: 4 x 4 x 4 keys */
@@ -1128,6 +1213,12 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
     key = (addr & 0xF0F);
     if (((filter >> 24) & 0xF) == 1) key |= 0x10000;
     if (((filter >> 16) & 0xFF) == 1) key |= 0x20000;
+    /* The anisotropy level rides in the key so a menu change takes effect
+     * on the next draw without flushing the sampler cache. */
+    if (s_aniso > 0) {
+        int idx = s_aniso >= 16 ? 4 : s_aniso >= 8 ? 3 : s_aniso >= 4 ? 2 : 1;
+        key |= (uint32_t)idx << 20;
+    }
     out->sampler = sampler_get(key);
 }
 
@@ -1536,7 +1627,35 @@ static VkProg *prog_get(const Nv2aRawBatch *b, const Nv2aPshKey *pk)
 typedef struct {
     int      prog;
     uint32_t blend, bsrc, bdst, beq, cmask, depth, topo;
+    uint32_t vlay;                   /* s_vlay index; 0 where vertex input is dynamic */
 } PipeKey;
+
+/* One vertex layout: per attribute the binding stride and the format, as
+ * upload_vertices will bind them. Drivers without
+ * VK_EXT_vertex_input_dynamic_state (MoltenVK) need it baked into the
+ * pipeline, so pipelines are keyed by it and the small set of layouts the
+ * title uses is interned here. */
+typedef struct {
+    uint32_t stride[NV2A_RAW_ATTRS];
+    uint32_t format[NV2A_RAW_ATTRS];
+} VLayout;
+#define VK_MAX_VLAY 64
+static VLayout s_vlay[VK_MAX_VLAY];
+static int s_nvlay;
+
+static uint32_t vlay_register(const VLayout *l)
+{
+    int i;
+    for (i = 0; i < s_nvlay; i++)
+        if (!memcmp(&s_vlay[i], l, sizeof *l))
+            return (uint32_t)i;
+    if (s_nvlay < VK_MAX_VLAY) {
+        s_vlay[s_nvlay] = *l;
+        return (uint32_t)s_nvlay++;
+    }
+    LOGE("vertex layout table full; reusing layout 0\n");
+    return 0;
+}
 
 typedef struct {
     PipeKey key;
@@ -1603,13 +1722,17 @@ static VkBlendOp blend_op(uint32_t v)
 }
 
 /* vkpipes.bin: the program by what generated it, and the pipeline's own
- * state. */
-#define PIPE_REC_MAGIC 0x4C504B56u              /* "VKPL" */
+ * state. pad = 1 when the record also carries the vertex layout (drivers
+ * without VK_EXT_vertex_input_dynamic_state; the magic is newer than the
+ * layout-less records, so old files are rejected). */
+#define PIPE_REC_MAGIC 0x4D504B56u              /* "VKPM" */
 typedef struct {
     uint32_t   magic, pad;
     uint64_t   vkey;
     Nv2aPshKey pk;
     uint32_t   blend, bsrc, bdst, beq, cmask, depth, topo;
+    uint32_t   vf[NV2A_RAW_ATTRS];
+    uint32_t   vst[NV2A_RAW_ATTRS];
 } PipeRec;
 static uint32_t s_pipes_unsaved;
 
@@ -1626,6 +1749,11 @@ static void pipe_rec_append(const PipeKey *k)
     rec.pk = s_prog[k->prog].pkey;
     rec.blend = k->blend; rec.bsrc = k->bsrc; rec.bdst = k->bdst; rec.beq = k->beq;
     rec.cmask = k->cmask; rec.depth = k->depth; rec.topo = k->topo;
+    if (!s_dyn_vi && k->vlay < (uint32_t)s_nvlay) {
+        rec.pad = 1;
+        memcpy(rec.vf, s_vlay[k->vlay].format, sizeof rec.vf);
+        memcpy(rec.vst, s_vlay[k->vlay].stride, sizeof rec.vst);
+    }
     if ((f = fopen(path, "ab"))) {
         fwrite(&rec, sizeof rec, 1, f);
         fclose(f);
@@ -1651,7 +1779,7 @@ static VkPipeline pipe_get(const PipeKey *k)
     VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     VkPipelineRenderingCreateInfo rci = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
     VkFormat cfmt = VK_FORMAT_B8G8R8A8_UNORM;
-    static const VkDynamicState dyn[] = {
+    static const VkDynamicState dyn_all[] = {
         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
         VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_CULL_MODE,
@@ -1660,6 +1788,10 @@ static VkPipeline pipe_get(const PipeKey *k)
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
         VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
     };
+    VkDynamicState dyn[16];
+    uint32_t ndyn = (uint32_t)(sizeof dyn_all / sizeof dyn_all[0]);
+    VkVertexInputBindingDescription vbind[NV2A_RAW_ATTRS];
+    VkVertexInputAttributeDescription vattr[NV2A_RAW_ATTRS];
     VkPipeline pipe = VK_NULL_HANDLE;
     VkProg *p = &s_prog[k->prog];
 
@@ -1695,7 +1827,30 @@ static VkPipeline pipe_get(const PipeKey *k)
     ba.colorWriteMask = k->cmask;
     cb.attachmentCount = 1;
     cb.pAttachments = &ba;
-    dy.dynamicStateCount = (uint32_t)(sizeof dyn / sizeof dyn[0]);
+    for (i = 0; i < ndyn; i++)
+        dyn[i] = dyn_all[i];
+    if (!s_dyn_vi) {
+        /* No VK_EXT_vertex_input_dynamic_state (MoltenVK): the layout this
+         * pipeline was keyed by becomes part of it, and the dynamic state
+         * entry goes away. */
+        const VLayout *l = (k->vlay < (uint32_t)s_nvlay) ? &s_vlay[k->vlay] : &s_vlay[0];
+        ndyn--;
+        memset(vbind, 0, sizeof vbind);
+        memset(vattr, 0, sizeof vattr);
+        for (i = 0; i < NV2A_RAW_ATTRS; i++) {
+            vbind[i].binding = i;
+            vbind[i].stride = l->stride[i];
+            vbind[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            vattr[i].location = i;
+            vattr[i].binding = i;
+            vattr[i].format = (VkFormat)l->format[i];
+        }
+        vi.vertexBindingDescriptionCount = NV2A_RAW_ATTRS;
+        vi.pVertexBindingDescriptions = vbind;
+        vi.vertexAttributeDescriptionCount = NV2A_RAW_ATTRS;
+        vi.pVertexAttributeDescriptions = vattr;
+    }
+    dy.dynamicStateCount = ndyn;
     dy.pDynamicStates = dyn;
     rci.colorAttachmentCount = 1;
     rci.pColorAttachmentFormats = &cfmt;
@@ -1822,6 +1977,14 @@ static void prewarm(void)
             k.prog = (int)(p - s_prog);
             k.blend = pr.blend; k.bsrc = pr.bsrc; k.bdst = pr.bdst; k.beq = pr.beq;
             k.cmask = pr.cmask; k.depth = pr.depth; k.topo = pr.topo;
+            if (!s_dyn_vi) {
+                VLayout l;
+                if (!pr.pad)
+                    continue;               /* made where vertex input was dynamic */
+                memcpy(l.format, pr.vf, sizeof l.format);
+                memcpy(l.stride, pr.vst, sizeof l.stride);
+                k.vlay = vlay_register(&l);
+            }
             if (pipe_get(&k))
                 npipe++;
         }
@@ -1857,10 +2020,15 @@ static int create_swapchain(void)
         }
     /* The game paces itself (vblank emulation): presenting must not block
      * it. Horizon's immediate mode does not tear (nvnflinger composes). */
-    for (i = 0; i < nm; i++)
-        if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = modes[i];
-    for (i = 0; i < nm && mode == VK_PRESENT_MODE_FIFO_KHR; i++)
-        if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = modes[i];
+    if (s_vsync == 1) {
+        mode = VK_PRESENT_MODE_FIFO_KHR;   /* guaranteed everywhere */
+    } else if (s_vsync != 0) {
+        for (i = 0; i < nm; i++)
+            if (modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) mode = modes[i];
+        for (i = 0; i < nm && mode == VK_PRESENT_MODE_FIFO_KHR; i++)
+            if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = modes[i];
+    }
+    s_sc_vsync = (mode == VK_PRESENT_MODE_FIFO_KHR);
     s_sc_extent = caps.currentExtent;
     if (s_sc_extent.width == 0xFFFFFFFFu) {
         s_sc_extent.width = 1280;
@@ -1898,6 +2066,7 @@ static int ready(void)
 {
     VkApplicationInfo ai = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    ici.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     const char *iext[8];
     uint32_t niext = 0, n, i;
     VkPhysicalDevice pds[8];
@@ -1913,7 +2082,7 @@ static int ready(void)
     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT feds =
         { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT };
     VkPhysicalDeviceFeatures have;
-    const char *dext[4];
+    const char *dext[6];
     uint32_t ndext = 0;
     const char *layers[1];
     uint32_t nlayers = 0;
@@ -1936,29 +2105,69 @@ static int ready(void)
     {
         const char *e = getenv("RECOMP_VK_HEADLESS");
         const char *drv = getenv("SDL_VIDEODRIVER");
+        static int once = 1;
+        if (once) {
+            LOGE("SDL_VIDEODRIVER=%s\n", drv ? drv : "(null)");
+            const char *vk_icd = getenv("VK_ICD_FILENAMES");
+            LOGE("VK_ICD_FILENAMES=%s\n", vk_icd ? vk_icd : "(null)");
+            once = 0;
+        }
         s_headless = (e && *e == '1') || (drv && !strcmp(drv, "offscreen"));
         if (!s_headless) {
+            /* SDL dlopens the loader by name ("libvulkan.1.dylib"), which
+             * dyld does not find on Apple Silicon: Homebrew's lib lives in
+             * /opt/homebrew/lib, outside the default search path. Load it
+             * by absolute path first so SDL_CreateWindow(SDL_WINDOW_VULKAN)
+             * does not fail with "Failed to load Vulkan Portability library". */
+            if (!SDL_Vulkan_GetVkGetInstanceProcAddr() && SDL_Vulkan_LoadLibrary(NULL) != 0) {
+                static const char *const ldr[] = {
+                    "/opt/homebrew/lib/libvulkan.1.dylib",
+                    "/usr/local/lib/libvulkan.1.dylib",
+                    "/opt/local/lib/libvulkan.1.dylib",
+                };
+                for (i = 0; i < 3 && !SDL_Vulkan_GetVkGetInstanceProcAddr(); i++)
+                    if (SDL_Vulkan_LoadLibrary(ldr[i]) == 0)
+                        LOGE("Vulkan loader: %s\n", ldr[i]);
+            }
+            /* Cocoa only lets the process' main thread own the window. */
             if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+                LOGE("SDL_InitSubSystem failed: %s\n", SDL_GetError());
                 s_headless = 1;
             } else {
                 s_win = SDL_CreateWindow("NV2A (Vulkan)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                          1280, 720, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
                 if (!s_win) {
+                    LOGE("SDL_CreateWindow failed: %s\n", SDL_GetError());
                     s_headless = 1;
                 } else {
                     unsigned int ne = 0;
                     const char *names[8];
                     SDL_Vulkan_GetInstanceExtensions(s_win, &ne, NULL);
-                    if (ne > 6) ne = 6;
+                    if (ne > 7) ne = 7;
                     SDL_Vulkan_GetInstanceExtensions(s_win, &ne, names);
                     niext = 0;
-                    for (i = 0; i < ne; i++)
-                        iext[niext++] = names[i];
+                    for (i = 0; i < ne; i++) {
+                        uint32_t j, dup = 0;
+                        for (j = 0; j < niext; j++)
+                            if (!strcmp(iext[j], names[i]))
+                                dup = 1;
+                        if (!dup)
+                            iext[niext++] = names[i];
+                    }
                 }
             }
         }
-        if (s_headless)
+        if (s_headless) {
             niext = 0;
+        }
+    }
+    {
+        uint32_t j, dup = 0;
+        for (j = 0; j < niext; j++)
+            if (!strcmp(iext[j], VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME))
+                dup = 1;
+        if (!dup && niext < 8)
+            iext[niext++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
     }
     {
         const char *v = getenv("RECOMP_VK_VALIDATION");
@@ -1993,6 +2202,14 @@ static int ready(void)
         const char *e = getenv("RECOMP_GL_SCALE");
         double k = e ? strtod(e, NULL) : 1.0;
         uint32_t m = pp.limits.maxImageDimension2D;
+#if !defined(_WIN32)
+        if (!e) {
+            /* The settings menu keeps SCALE in the cfg when no variable wins. */
+            char v[16];
+            if (xbox_CfgGet("SCALE", v, sizeof v))
+                k = strtod(v, NULL);
+        }
+#endif
         if (pp.limits.maxFramebufferWidth < m) m = pp.limits.maxFramebufferWidth;
         if (pp.limits.maxFramebufferHeight < m) m = pp.limits.maxFramebufferHeight;
         s_max_size = m ? m : 4096;
@@ -2002,11 +2219,61 @@ static int ready(void)
             fprintf(stderr, "  [VK] rendering at %gx (RECOMP_GL_SCALE), surfaces up to %u\n",
                     s_scale, s_max_size);
     }
+    {
+        /* The settings menu keeps VSYNC there when RECOMP_VSYNC is unset:
+         * 1 waits for vblank, 0 presents as fast as the driver lets it. */
+        const char *e = getenv("RECOMP_VSYNC");
+#if !defined(_WIN32)
+        char v[16];
+#endif
+        if (e)
+            s_vsync = atoi(e) ? 1 : 0;
+#if !defined(_WIN32)
+        else if (xbox_CfgGet("VSYNC", v, sizeof v))
+            s_vsync = atoi(v) ? 1 : 0;
+#endif
+        if (s_vsync >= 0)
+            fprintf(stderr, "  [VK] vsync %s\n", s_vsync ? "on" : "off");
+    }
     if (s_ubo_align < 16) s_ubo_align = 16;
     vkGetPhysicalDeviceMemoryProperties(s_pd, &s_memprops);
     vkGetPhysicalDeviceFeatures(s_pd, &have);
     s_have_bc = have.textureCompressionBC;
     s_have_depth_clamp = have.depthClamp;
+    s_have_aniso = have.samplerAnisotropy;
+    s_max_aniso = pp.limits.maxSamplerAnisotropy;
+    if (s_max_aniso > 16.0f) s_max_aniso = 16.0f;
+    if (s_max_aniso < 1.0f) s_max_aniso = 1.0f;
+    {
+        /* Anisotropic filtering level: 0 off, else 2/4/8/16, clamped to
+         * the device limit. Env RECOMP_ANISO wins, else cfg ANISO, else
+         * off. The level rides in the sampler cache key (bind_stage), so
+         * a menu change takes effect on the next draw with no flush. */
+        const char *e = getenv("RECOMP_ANISO");
+#if !defined(_WIN32)
+        char v[16];
+#endif
+        int a = 0;
+        if (e)
+            a = atoi(e);
+#if !defined(_WIN32)
+        else if (xbox_CfgGet("ANISO", v, sizeof v))
+            a = atoi(v);
+#endif
+        if (a < 0) a = 0;
+        if (a > 16) a = 16;
+        /* Snap to a real level so the sampler cache key stays small. */
+        s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 0;
+        if (s_aniso > 0) {
+            if (!s_have_aniso)
+                s_aniso = 0;
+            else if ((float)s_aniso > s_max_aniso)
+                s_aniso = (int)s_max_aniso;
+            if (s_aniso > 0)
+                fprintf(stderr, "  [VK] anisotropic filtering x%d (of %.0f)\n",
+                        s_aniso, s_max_aniso);
+        }
+    }
     {
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(s_pd, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
@@ -2050,31 +2317,99 @@ static int ready(void)
     qci.queueFamilyIndex = s_qfam;
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
-    f13.dynamicRendering = VK_TRUE;
-    fvi.vertexInputDynamicState = VK_TRUE;
-    feds.extendedDynamicState = VK_TRUE;
-    f13.pNext = &fvi;
-    f2.pNext = &f13;
-    f2.features.textureCompressionBC = s_have_bc ? VK_TRUE : VK_FALSE;
-    f2.features.depthClamp = s_have_depth_clamp ? VK_TRUE : VK_FALSE;
-    if (!s_headless)
-        dext[ndext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-    dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
-    dext[ndext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
+
+    /* Ask only for what this driver really has. MoltenVK (macOS) has no
+     * VK_EXT_vertex_input_dynamic_state, and enabling an extension the ICD
+     * does not implement makes vkCreateDevice fail outright. */
+    {
+        VkExtensionProperties de[256];
+        VkPhysicalDeviceFeatures2 q2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        VkPhysicalDeviceVulkan13Features q13 =
+            { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+        VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT qvi =
+            { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT };
+        VkPhysicalDeviceExtendedDynamicStateFeaturesEXT qeds =
+            { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT };
+        uint32_t nde = 256;
+        int has_push = 0, has_vi = 0, has_ps = 0, has_swap = 0;
+        VkResult er;
+
+        memset(de, 0, sizeof de);
+        /* MoltenVK lists 130 extensions: a too-small array comes back
+         * VK_INCOMPLETE, which is not an error. */
+        er = vkEnumerateDeviceExtensionProperties(s_pd, NULL, &nde, de);
+        if (er == VK_SUCCESS || er == VK_INCOMPLETE) {
+            for (i = 0; i < nde; i++) {
+                const char *nm = de[i].extensionName;
+                if (!strcmp(nm, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) has_push = 1;
+                else if (!strcmp(nm, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME)) has_vi = 1;
+                else if (!strcmp(nm, "VK_KHR_portability_subset")) has_ps = 1;
+                else if (!strcmp(nm, VK_KHR_SWAPCHAIN_EXTENSION_NAME)) has_swap = 1;
+            }
+        }
+        if (!has_push) {
+            LOGE("driver has no %s\n", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+            return 0;
+        }
+        if (!s_headless && !has_swap) {
+            LOGE("driver has no %s; running headless\n", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+            s_headless = 1;
+        }
+
+        q2.pNext = &q13;
+        q13.pNext = &qvi;
+        qvi.pNext = &qeds;
+        vkGetPhysicalDeviceFeatures2(s_pd, &q2);
+        if (!q13.dynamicRendering) {
+            LOGE("driver has no dynamic rendering (Vulkan 1.3)\n");
+            return 0;
+        }
+        s_dyn_vi = has_vi && qvi.vertexInputDynamicState;
+        if (!qeds.extendedDynamicState)
+            LOGE("driver has no extended dynamic state\n");
+
+        f13.dynamicRendering = VK_TRUE;
+        fvi.vertexInputDynamicState = s_dyn_vi ? VK_TRUE : VK_FALSE;
+        feds.extendedDynamicState = qeds.extendedDynamicState ? VK_TRUE : VK_FALSE;
+        if (s_dyn_vi) {
+            f13.pNext = &fvi;
+            fvi.pNext = &feds;
+        } else {
+            f13.pNext = &feds;
+        }
+        f2.pNext = &f13;
+        f2.features.textureCompressionBC = s_have_bc ? VK_TRUE : VK_FALSE;
+        f2.features.depthClamp = s_have_depth_clamp ? VK_TRUE : VK_FALSE;
+        f2.features.samplerAnisotropy = s_have_aniso ? VK_TRUE : VK_FALSE;
+
+        ndext = 0;
+        if (!s_headless)
+            dext[ndext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+        dext[ndext++] = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
+        if (s_dyn_vi)
+            dext[ndext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
+        if (has_ps)
+            dext[ndext++] = "VK_KHR_portability_subset";
+    }
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = ndext;
     dci.ppEnabledExtensionNames = dext;
-    (void)feds;
     if (vkCreateDevice(s_pd, &dci, NULL, &s_dev) != VK_SUCCESS) {
-        LOGE("vkCreateDevice failed (needs push descriptors, dynamic vertex input, Vulkan 1.3)\n");
+        LOGE("vkCreateDevice failed (%u extensions, dynamic vertex input %s)\n",
+             ndext, s_dyn_vi ? "on" : "off");
         return 0;
     }
     vkGetDeviceQueue(s_dev, s_qfam, 0, &s_queue);
 #define GET(p, name) p = (void *)vkGetDeviceProcAddr(s_dev, name); if (!p) { LOGE("missing %s\n", name); return 0; }
     GET(p_push_desc, "vkCmdPushDescriptorSetKHR");
-    GET(p_vertex_input, "vkCmdSetVertexInputEXT");
+    if (s_dyn_vi) {
+        GET(p_vertex_input, "vkCmdSetVertexInputEXT");
+    } else {
+        p_vertex_input = NULL;
+        LOGE("no dynamic vertex input: pipelines carry the vertex layout\n");
+    }
     GET(p_begin_rendering, "vkCmdBeginRendering");
     GET(p_end_rendering, "vkCmdEndRendering");
     GET(p_cull_mode, "vkCmdSetCullMode");
@@ -2148,7 +2483,6 @@ static int ready(void)
         vkAllocateCommandBuffers(s_dev, &cai, &f->cb);
         vkCreateFence(s_dev, &fci, NULL, &f->fence);
         vkCreateSemaphore(s_dev, &sci, NULL, &f->acquired);
-        vkCreateSemaphore(s_dev, &sci, NULL, &f->rendered);
         bci.size = RING_BYTES;
         bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
@@ -2161,6 +2495,14 @@ static int ready(void)
             vkMapMemory(s_dev, f->ring_mem, 0, RING_BYTES, 0, (void **)&f->ring_ptr) != VK_SUCCESS) {
             LOGE("frame ring allocation failed\n");
             return 0;
+        }
+    }
+    {
+        uint32_t ri;
+        for (ri = 0; ri < 8; ri++) {
+            VkSemaphoreCreateInfo rci2 = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            if (vkCreateSemaphore(s_dev, &rci2, NULL, &s_rend[ri]) != VK_SUCCESS)
+                return 0;
         }
     }
     s_fi = 0;
@@ -2340,7 +2682,31 @@ static int prim_indices(const Nv2aRawBatch *b, const uint32_t **idx, uint32_t *n
     case 4: *topo = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; *cls = 1; return 1;
     case 5: *topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; *cls = 2; return 1;
     case 6: case 9: *topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; *cls = 2; return 1;
-    case 7: case 10: *topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; *cls = 2; return 1;
+    case 7: case 10: {                              /* TRIANGLE_FAN -> list */
+        /* Metal has no triangle fan and MoltenVK's dynamic-topology path
+         * draws the fan's indices as a list, so a 4-index fan (the title's
+         * full-screen quads) comes out as one triangle: half the screen.
+         * Expand the fan here, like QUADS below. */
+        size_t need;
+        if (b->index_count < 3) { *n = 0; return 0; }
+        need = (size_t)(b->index_count - 2) * 3;
+        if (need > s_prim_cap) {
+            free(s_prim_idx);
+            s_prim_cap = need + 1024;
+            s_prim_idx = (uint32_t *)malloc(s_prim_cap * 4);
+        }
+        if (!s_prim_idx) { *n = 0; return 0; }
+        for (i = 1; i + 1 < b->index_count; i++) {
+            s_prim_idx[m++] = b->indices[0];
+            s_prim_idx[m++] = b->indices[i];
+            s_prim_idx[m++] = b->indices[i + 1];
+        }
+        *idx = s_prim_idx;
+        *n = m;
+        *topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        *cls = 2;
+        return 1;
+    }
     case 3:                                      /* LINE_LOOP: strip + first */
     case 8: {                                    /* QUADS -> triangles */
         size_t need = b->prim == 3 ? (size_t)b->index_count + 1 : (size_t)b->index_count / 4 * 6;
@@ -2502,6 +2868,41 @@ static void attr_to_float4(const Nv2aRawBatch *b, uint32_t a, uint32_t v, float 
     }
 }
 
+/* The layout upload_vertices is about to bind, interned for the pipelines
+ * that must carry it (no VK_EXT_vertex_input_dynamic_state). Decides exactly
+ * what the loop below binds: direct attributes keep their format and stride,
+ * converted ones become float4 with the packed stride, absent ones the
+ * constant float4 with stride 0. */
+static uint32_t vlayout_of(const Nv2aRawBatch *b)
+{
+    VLayout l;
+    uint16_t direct = 0, conv;
+    uint32_t np = 0, a;
+
+    if (s_dyn_vi)
+        return 0;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        l.stride[a] = 0;
+        l.format[a] = VK_FORMAT_R32G32B32A32_SFLOAT;
+        if ((b->attr_direct & (1u << a)) &&
+            vertex_format(b->direct[a].type, b->direct[a].size) != VK_FORMAT_UNDEFINED)
+            direct |= (uint16_t)(1u << a);
+    }
+    conv = (uint16_t)(b->attr_present & (uint16_t)~direct);
+    for (a = 0; a < NV2A_RAW_ATTRS; a++)
+        if (conv & (1u << a))
+            np++;
+    for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+        if (direct & (1u << a)) {
+            l.stride[a] = b->direct[a].stride;
+            l.format[a] = (uint32_t)vertex_format(b->direct[a].type, b->direct[a].size);
+        } else if (conv & (1u << a)) {
+            l.stride[a] = np * 16;
+        }
+    }
+    return vlay_register(&l);
+}
+
 static int upload_vertices(const Nv2aRawBatch *b)
 {
     VRun run[NV2A_RAW_ATTRS];
@@ -2589,7 +2990,8 @@ static int upload_vertices(const Nv2aRawBatch *b)
             offs[a] = at + const_at + a * 16;
         }
     }
-    p_vertex_input(s_cb, NV2A_RAW_ATTRS, bind, NV2A_RAW_ATTRS, attr);
+    if (s_dyn_vi)
+        p_vertex_input(s_cb, NV2A_RAW_ATTRS, bind, NV2A_RAW_ATTRS, attr);
     vkCmdBindVertexBuffers(s_cb, 0, NV2A_RAW_ATTRS, bufs, offs);
     return 1;
 }
@@ -2887,9 +3289,69 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
     }
     key.depth = d != NULL;
     key.topo = cls;
+    key.vlay = vlayout_of(b);
     pipe = pipe_get(&key);
     if (!pipe)
         return;
+    {   /* RECOMP_VK_DRAWLOG=<lo>,<hi>: dump the draws of frames lo..hi. */
+        static int lo = -1, hi;
+        if (lo < 0) {
+            const char *e = getenv("RECOMP_VK_DRAWLOG");
+            lo = 0; hi = 0;
+            if (e && *e) {
+                lo = atoi(e);
+                hi = strchr(e, ',') ? atoi(strchr(e, ',') + 1) : lo + 1;
+                if (hi <= lo) hi = lo + 1;
+            }
+        }
+        if (hi && s_frame >= (uint32_t)lo && s_frame < (uint32_t)hi) {
+            uint32_t mn = 0xFFFFFFFFu, mx = 0, a, pd;
+            for (i = 0; i < n; i++) {
+                if (idx[i] < mn) mn = idx[i];
+                if (idx[i] > mx) mx = idx[i];
+            }
+            fprintf(stderr, "[VKD] f%u prim%u nv%u ni%u idx[%u..%u] xform%u pres%04X dir%04X "
+                    "lay%u prog%u cls%u n%u surf%ux%u", s_frame, b->prim, b->vertex_count,
+                    b->index_count, mn, mx, b->xform, b->attr_present, b->attr_direct,
+                    key.vlay, key.prog, cls, n, s ? s->w : 0, s ? s->h : 0);
+            for (a = 0; a < NV2A_RAW_ATTRS; a++) {
+                pd = b->attr_present & (1u << a);
+                if (!pd)
+                    continue;
+                fprintf(stderr, " a%u=%u/%u/%u", a, b->direct[a].type, b->direct[a].size,
+                        (b->attr_direct & (1u << a)) ? b->direct[a].stride : 0);
+            }
+            fprintf(stderr, " i0=[%u %u %u %u]\n", n > 0 ? idx[0] : 0, n > 1 ? idx[1] : 0,
+                    n > 2 ? idx[2] : 0, n > 3 ? idx[3] : 0);
+            if (b->vertex_count <= 4) {
+                uint32_t v;
+                for (v = 0; v < b->vertex_count; v++) {
+                    const float *p;
+                    float tmp[4];
+                    if (b->attr_present & 1u) {
+                        if (b->attr_direct & 1u)
+                            p = (const float *)(b->direct[0].ptr + (size_t)v * b->direct[0].stride);
+                        else
+                            p = b->attrs + ((size_t)v * NV2A_RAW_ATTRS) * 4;
+                    } else {
+                        p = b->attr_const + 0;
+                    }
+                    memcpy(tmp, p, sizeof tmp);
+                    fprintf(stderr, "[VKD]   pos[%u] = %g %g %g %g%s\n", v, tmp[0], tmp[1],
+                            tmp[2], tmp[3], (b->attr_direct & 1u) ? " (direct)" : " (attrs)");
+                }
+                fprintf(stderr, "[VKD]   c[0..3] = %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n",
+                        ((const float *)b->vp_consts)[0], ((const float *)b->vp_consts)[1],
+                        ((const float *)b->vp_consts)[2], ((const float *)b->vp_consts)[3],
+                        ((const float *)b->vp_consts)[4], ((const float *)b->vp_consts)[5],
+                        ((const float *)b->vp_consts)[6], ((const float *)b->vp_consts)[7],
+                        ((const float *)b->vp_consts)[8], ((const float *)b->vp_consts)[9],
+                        ((const float *)b->vp_consts)[10], ((const float *)b->vp_consts)[11],
+                        ((const float *)b->vp_consts)[12], ((const float *)b->vp_consts)[13],
+                        ((const float *)b->vp_consts)[14], ((const float *)b->vp_consts)[15]);
+            }
+        }
+    }
 
     {
         /* Everything this draw puts in the ring, reserved now: a flush
@@ -2930,7 +3392,14 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
         vb->surf[0] = 2.0f / (float)s->w;
         vb->surf[1] = 2.0f / (float)s->h;
         vb->surf[2] = 1.0f / (float)zmax_of(r);
-        vb->surf[3] = 0.5f - 0.5f * (float)s->w / (float)s->pw; /* see nv2a_snap */
+        /* No snap offset (see nv2a_snap): shifting every vertex by
+         * (0.5 - 0.5/k) title pixels at scale k > 1 misaligns geometry
+         * with the CPU scissor/clear rects, leaving 1-px strips of stale
+         * content at every interior rect edge (magenta grid lines from
+         * the glow accumulator at x2/x3). The unshifted snap keeps
+         * geometry exactly on the rects; row/column 0 stays covered by
+         * the (padded) clear instead. */
+        vb->surf[3] = 0.0f;
         memcpy(vb->m, b->composite, sizeof vb->m);
         memcpy(vb->vpoff, b->vp_offset, sizeof vb->vpoff);
         vb->aa[0] = b->aa_sx > 0 ? b->aa_sx : 1.0f;
@@ -3051,14 +3520,22 @@ static void vk_clear(const Nv2aSurface *sf, const Nv2aRenderState *rs,
         uint32_t hz = s_regs[0x1D98 / 4], vt = s_regs[0x1D9C / 4];
         uint32_t x0 = (hz & 0xFFFF) * s->aa_sx, x1 = ((hz >> 16) + 1) * s->aa_sx;
         uint32_t y0 = (vt & 0xFFFF) * s->aa_sy, y1 = ((vt >> 16) + 1) * s->aa_sy;
+        uint32_t pad = s_rect_pad();
         if (x1 > s->w) x1 = s->w;
         if (y1 > s->h) y1 = s->h;
         if (x1 > x0 && y1 > y0) {
-            uint32_t px0 = to_stored(x0, s->pw, s->w), py0 = to_stored(y0, s->ph, s->h);
-            rect.rect.offset.x = (int32_t)px0;
-            rect.rect.offset.y = (int32_t)py0;
-            rect.rect.extent.width = to_stored(x1, s->pw, s->w) - px0;
-            rect.rect.extent.height = to_stored(y1, s->ph, s->h) - py0;
+            int32_t ox0 = (int32_t)to_stored(x0, s->pw, s->w) - (int32_t)pad;
+            int32_t oy0 = (int32_t)to_stored(y0, s->ph, s->h) - (int32_t)pad;
+            int32_t ox1 = (int32_t)to_stored(x1, s->pw, s->w) + (int32_t)pad;
+            int32_t oy1 = (int32_t)to_stored(y1, s->ph, s->h) + (int32_t)pad;
+            if (ox0 < 0) ox0 = 0;
+            if (oy0 < 0) oy0 = 0;
+            if ((uint32_t)ox1 > s->pw) ox1 = (int32_t)s->pw;
+            if ((uint32_t)oy1 > s->ph) oy1 = (int32_t)s->ph;
+            rect.rect.offset.x = ox0;
+            rect.rect.offset.y = oy0;
+            rect.rect.extent.width = (uint32_t)(ox1 - ox0);
+            rect.rect.extent.height = (uint32_t)(oy1 - oy0);
         }
     }
     if (d && rect.rect.extent.width > d->pw - (uint32_t)rect.rect.offset.x)
@@ -3153,6 +3630,672 @@ static void dump_surface(VkSurf *s, const char *path)
     vkDestroyBuffer(s_dev, buf, NULL);
     vkFreeMemory(s_dev, mem, NULL);
 }
+
+#if !defined(__SWITCH__)
+void xbox_KeyState(int scancode, int down);  /* xinput_device.c */
+void xbox_KeyClear(void);
+
+/* The F1 settings menu lives below (it needs the whole renderer around
+ * it); the pump only toggles it and feeds it keys. */
+#if !defined(__SWITCH__) && !defined(_WIN32)
+void xbox_MenuToggle(void);
+int xbox_MenuOpen(void);
+static void menu_key(SDL_Scancode sc, SDL_Keycode sym);
+#endif
+
+/* The window's events, in one place: close (the X), F1, RECOMP_KEY_TRACE.
+ * Called from the process' main thread on macOS (nv2a_vk_pump) and from
+ * the flip elsewhere -- Cocoa only lets the first touch them. */
+static void pump_events(void)
+{
+    static int trace = -1;
+    SDL_Event e;
+
+    while (SDL_PollEvent(&e)) {
+        if (e.type == SDL_QUIT ||
+            (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_CLOSE)) {
+            fprintf(stderr, "[VK] window closed\n");
+            fflush(stderr);
+            exit(0);
+        }
+        if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP)
+            xbox_KeyState((int)e.key.keysym.scancode, e.type == SDL_KEYDOWN);
+        else if (e.type == SDL_WINDOWEVENT &&
+                 e.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+            xbox_KeyClear();            /* never leave a key stuck down */
+        if (trace < 0) {
+            const char *t = getenv("RECOMP_KEY_TRACE");
+            trace = (t && *t && *t != '0') ? 1 : 0;
+        }
+        if (trace && (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP))
+            fprintf(stderr, "  [KEY] %s%s %s\n",
+                    e.type == SDL_KEYDOWN ? "down " : "up   ",
+                    e.key.repeat ? "rep " : "    ",
+                    SDL_GetScancodeName(e.key.keysym.scancode));
+        if (e.type == SDL_KEYDOWN && !e.key.repeat && e.key.keysym.sym == SDLK_F1) {
+            xbox_MenuToggle();          /* the settings menu (below) */
+        } else if (xbox_MenuOpen() && e.type == SDL_KEYDOWN) {
+            menu_key(e.key.keysym.scancode, e.key.keysym.sym);
+        }
+    }
+}
+#endif
+
+#if !defined(__SWITCH__) && !defined(_WIN32)
+#include "../apu/apu_xaudio2.h"            /* volume */
+
+/* Win32 virtual keys for the key rows, as in win32_compat.h (stable ABI;
+ * that header is not included here: it pulls the platform vocabulary). */
+enum {
+    MVK_BACK = 0x08, MVK_RETURN = 0x0D, MVK_SHIFT = 0x10, MVK_CONTROL = 0x11,
+    MVK_LEFT = 0x25, MVK_UP = 0x26, MVK_RIGHT = 0x27, MVK_DOWN = 0x28,
+    MVK_NUMPAD2 = 0x62, MVK_NUMPAD4 = 0x64, MVK_NUMPAD6 = 0x66, MVK_NUMPAD8 = 0x68,
+};
+
+int xbox_MenuOpen(void);
+void xbox_MenuToggle(void);
+int  xbox_KbOverrideGet(int vk);
+void xbox_KbOverrideSet(int vk, int scancode);
+void xbox_KbOverrideClear(void);
+void xbox_KbSave(void);
+
+/* ── Settings menu (F1) ───────────────────────────────────────────────
+ *
+ * A text panel drawn over the presented frame, in the corner: GRAPHICS
+ * (render scale x1/x2/x3 applied live, vsync), KEYBOARD (every action
+ * remappable: Enter captures the next key, twice for a stick axis),
+ * AUDIO (volume). Arrows move and adjust, Enter activates, Esc closes.
+ * Everything persists in nfsu2.cfg next to the working directory;
+ * RECOMP_MENU_OPEN=1 opens it at boot (to look at it without a keyboard).
+ *
+ * No system font is assumed: a 5x7 bitmap font, scaled 2x, rasterized when
+ * the menu changes and blitted opaque after the frame (vkCmdBlitImage
+ * replaces, it does not blend, so the panel has its own background). */
+
+/* 5 bytes per glyph, bit 0 = top row. */
+static const char s_font_chars[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:-/.()+%_?[]*";
+static const uint8_t s_font_data[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, {0x7e,0x11,0x11,0x11,0x7e}, {0x7f,0x49,0x49,0x49,0x36},
+    {0x3e,0x41,0x41,0x41,0x22}, {0x7f,0x41,0x41,0x22,0x1c}, {0x7f,0x49,0x49,0x49,0x41},
+    {0x7f,0x09,0x09,0x09,0x01}, {0x3e,0x41,0x49,0x49,0x7a}, {0x7f,0x08,0x08,0x08,0x7f},
+    {0x00,0x41,0x7f,0x41,0x00}, {0x20,0x40,0x41,0x3f,0x01}, {0x7f,0x08,0x14,0x22,0x41},
+    {0x7f,0x40,0x40,0x40,0x40}, {0x7f,0x02,0x0c,0x02,0x7f}, {0x7f,0x04,0x08,0x10,0x7f},
+    {0x3e,0x41,0x41,0x41,0x3e}, {0x7f,0x09,0x09,0x09,0x06}, {0x3e,0x41,0x51,0x21,0x5e},
+    {0x7f,0x09,0x19,0x29,0x46}, {0x46,0x49,0x49,0x49,0x31}, {0x01,0x01,0x7f,0x01,0x01},
+    {0x7f,0x40,0x40,0x40,0x7f}, {0x1f,0x20,0x40,0x20,0x1f}, {0x7f,0x20,0x18,0x20,0x7f},
+    {0x63,0x14,0x08,0x14,0x63}, {0x07,0x08,0x70,0x08,0x07}, {0x61,0x51,0x49,0x45,0x43},
+    {0x3e,0x51,0x49,0x45,0x3e}, {0x00,0x42,0x7f,0x40,0x00}, {0x42,0x61,0x51,0x49,0x46},
+    {0x21,0x41,0x45,0x4b,0x31}, {0x18,0x14,0x12,0x7f,0x10}, {0x27,0x45,0x45,0x45,0x39},
+    {0x3c,0x4a,0x49,0x49,0x30}, {0x01,0x71,0x09,0x05,0x03}, {0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1e}, {0x00,0x36,0x36,0x00,0x00}, {0x08,0x08,0x08,0x08,0x08},
+    {0x20,0x10,0x08,0x04,0x02}, {0x00,0x60,0x60,0x00,0x00}, {0x00,0x1c,0x22,0x41,0x00},
+    {0x00,0x41,0x22,0x1c,0x00}, {0x08,0x08,0x3e,0x08,0x08}, {0x62,0x64,0x08,0x13,0x23},
+    {0x40,0x40,0x40,0x40,0x40}, {0x02,0x01,0x51,0x09,0x06},
+    /* '[', ']' and '*' (the remap marker used to fall back to '?'). */
+    {0x00,0x1F,0x11,0x11,0x00}, {0x00,0x11,0x11,0x1F,0x00}, {0x08,0x1C,0x3E,0x1C,0x08},
+};
+
+static const uint8_t *font_get(char c)
+{
+    const char *p;
+    if (c >= 'a' && c <= 'z')
+        c -= (char)('a' - 'A');
+    p = strchr(s_font_chars, c);
+    if (!p)
+        p = strchr(s_font_chars, '?');
+    return s_font_data[p - s_font_chars];
+}
+
+enum { MK_HEAD, MK_SCALE, MK_ANISO, MK_VSYNC, MK_KEY, MK_KEY2, MK_KEYRESET, MK_VOL };
+typedef struct { int kind; const char *label; int vk, vk2, d1, d2; } MenuRow;
+static const MenuRow s_menu_rows[] = {
+    { MK_HEAD, "GRAPHICS", 0, 0, 0, 0 },
+    { MK_SCALE, "SCALE", 0, 0, 0, 0 },
+    { MK_ANISO, "ANISO", 0, 0, 0, 0 },
+    { MK_HEAD, "VIDEO", 0, 0, 0, 0 },
+    { MK_VSYNC, "VSYNC", 0, 0, 0, 0 },
+    { MK_HEAD, "AUDIO", 0, 0, 0, 0 },
+    { MK_VOL, "VOLUME", 0, 0, 0, 0 },
+    { MK_HEAD, "CONTROLLER", 0, 0, 0, 0 },
+    { MK_KEY, "UP", MVK_UP, -1, SDL_SCANCODE_UP, -1 },
+    { MK_KEY, "DOWN", MVK_DOWN, -1, SDL_SCANCODE_DOWN, -1 },
+    { MK_KEY, "LEFT", MVK_LEFT, -1, SDL_SCANCODE_LEFT, -1 },
+    { MK_KEY, "RIGHT", MVK_RIGHT, -1, SDL_SCANCODE_RIGHT, -1 },
+    { MK_KEY, "START", MVK_RETURN, -1, SDL_SCANCODE_RETURN, -1 },
+    { MK_KEY, "BACK", MVK_BACK, -1, SDL_SCANCODE_BACKSPACE, -1 },
+    { MK_KEY, "LEFT STICK BTN", MVK_SHIFT, -1, SDL_SCANCODE_LSHIFT, -1 },
+    { MK_KEY, "RIGHT STICK BTN", MVK_CONTROL, -1, SDL_SCANCODE_LCTRL, -1 },
+    { MK_KEY, "BUTTON A", 'Z', -1, SDL_SCANCODE_Z, -1 },
+    { MK_KEY, "BUTTON B", 'X', -1, SDL_SCANCODE_X, -1 },
+    { MK_KEY, "BUTTON X", 'A', -1, SDL_SCANCODE_A, -1 },
+    { MK_KEY, "BUTTON Y", 'S', -1, SDL_SCANCODE_S, -1 },
+    { MK_KEY, "WHITE", 'Q', -1, SDL_SCANCODE_Q, -1 },
+    { MK_KEY, "BLACK", 'E', -1, SDL_SCANCODE_E, -1 },
+    { MK_KEY, "LEFT TRIGGER", '1', -1, SDL_SCANCODE_1, -1 },
+    { MK_KEY, "RIGHT TRIGGER", '3', -1, SDL_SCANCODE_3, -1 },
+    { MK_KEY2, "LEFT STICK X", MVK_NUMPAD4, MVK_NUMPAD6, SDL_SCANCODE_KP_4, SDL_SCANCODE_KP_6 },
+    { MK_KEY2, "LEFT STICK Y", MVK_NUMPAD2, MVK_NUMPAD8, SDL_SCANCODE_KP_2, SDL_SCANCODE_KP_8 },
+    { MK_KEY2, "RIGHT STICK X", 'J', 'L', SDL_SCANCODE_J, SDL_SCANCODE_L },
+    { MK_KEY2, "RIGHT STICK Y", 'K', 'I', SDL_SCANCODE_K, SDL_SCANCODE_I },
+    { MK_KEYRESET, "RESET KEYBOARD", 0, 0, 0, 0 },
+};
+#define MENU_NROWS (sizeof s_menu_rows / sizeof s_menu_rows[0])
+#define MENU_COLS 52
+#define MENU_PW (MENU_COLS * 12)
+#define MENU_PH (32 * 16)
+
+static int s_menu_sel = 1;      /* selected row; headers are skipped */
+static int s_menu_tab = 0;      /* active tab: the Nth MK_HEAD section */
+static int s_menu_cap;          /* 0 none, 1 one key, 2 axis negative, 3 axis positive */
+static int s_menu_cap_row;
+static int s_menu_dirty = 1;
+static VkImage s_menu_img;
+static VkImageView s_menu_view;
+static VkDeviceMemory s_menu_mem;
+static uint8_t *s_menu_px;
+
+/* Tabs are the MK_HEAD sections (GRAPHICS, VIDEO, AUDIO, CONTROLLER):
+ * menu_tab_range fills [start, end) with the row span of one tab. */
+static int menu_tab_count(void)
+{
+    int i, n = 0;
+    for (i = 0; i < (int)MENU_NROWS; i++)
+        if (s_menu_rows[i].kind == MK_HEAD)
+            n++;
+    return n ? n : 1;
+}
+static void menu_tab_range(int tab, int *start, int *end)
+{
+    int i, n = -1;
+    *start = 0;
+    *end = (int)MENU_NROWS;
+    for (i = 0; i < (int)MENU_NROWS; i++) {
+        if (s_menu_rows[i].kind != MK_HEAD)
+            continue;
+        n++;
+        if (n == tab)
+            *start = i;
+        else if (n == tab + 1) {
+            *end = i;
+            return;
+        }
+    }
+}
+static void menu_tab_goto(int tab)
+{
+    int start, end, i, n;
+    n = menu_tab_count();
+    tab %= n;
+    if (tab < 0) tab += n;
+    s_menu_tab = tab;
+    menu_tab_range(tab, &start, &end);
+    for (i = start; i < end; i++)
+        if (s_menu_rows[i].kind != MK_HEAD) {
+            s_menu_sel = i;
+            break;
+        }
+    s_menu_dirty = 1;
+}
+
+/* A scancode's name in the font's alphabet (uppercase ASCII, '?' else).
+ * "Keypad 4" becomes "KP 4": the panel is 52 columns wide. */
+static void menu_key_name(int sc, char *out, size_t cap)
+{
+    const char *n = (sc > 0 && sc < (int)SDL_NUM_SCANCODES) ? SDL_GetScancodeName((SDL_Scancode)sc) : "";
+    size_t i = 0, j = 0;
+    char tmp[32];
+    if (!n || !n[0]) {
+        snprintf(out, cap, "?");
+        return;
+    }
+    if (!strncmp(n, "Keypad ", 7)) {
+        tmp[0] = 'K'; tmp[1] = 'P'; tmp[2] = ' ';
+        strncpy(tmp + 3, n + 7, sizeof tmp - 4);
+        tmp[sizeof tmp - 1] = 0;
+        n = tmp;
+    }
+    while (n[j] && i + 1 < cap) {
+        char c = n[j++];
+        if (c >= 'a' && c <= 'z') c -= (char)('a' - 'A');
+        if (!strchr(s_font_chars, c)) c = '?';
+        out[i++] = c;
+    }
+    out[i] = 0;
+}
+
+/* The row's current value, right of the dots. */
+static void menu_value(const MenuRow *r, char *out, size_t cap)
+{
+    char a[24], b[24];
+    int o;
+    switch (r->kind) {
+    case MK_SCALE: {
+        double v = s_scale_pending ? s_scale_new : s_scale;
+        int k = (int)(v + 0.5);
+        if (k < 1) k = 1;
+        if (k > 3) k = 3;
+        snprintf(out, cap, "X%d", k);
+        return;
+    }
+    case MK_VSYNC:
+        snprintf(out, cap, "%s", s_sc_vsync ? "ON" : "OFF");
+        return;
+    case MK_ANISO:
+        if (s_aniso >= 16)
+            snprintf(out, cap, "X16");
+        else if (s_aniso >= 8)
+            snprintf(out, cap, "X8");
+        else if (s_aniso >= 4)
+            snprintf(out, cap, "X4");
+        else if (s_aniso >= 2)
+            snprintf(out, cap, "X2");
+        else
+            snprintf(out, cap, "OFF");
+        return;
+    case MK_VOL:
+        snprintf(out, cap, "%d", xbox_AudioGetVolume100());
+        return;
+    case MK_KEY:
+        o = xbox_KbOverrideGet(r->vk);
+        menu_key_name(o >= 0 ? o : r->d1, out, cap);
+        if (o >= 0 && strlen(out) + 2 < cap)
+            strcat(out, " *");
+        return;
+    case MK_KEY2: {
+        int o1 = xbox_KbOverrideGet(r->vk), o2 = xbox_KbOverrideGet(r->vk2);
+        menu_key_name(o1 >= 0 ? o1 : r->d1, a, sizeof a);
+        menu_key_name(o2 >= 0 ? o2 : r->d2, b, sizeof b);
+        snprintf(out, cap, "%s / %s", a, b);
+        return;
+    }
+    default:
+        out[0] = 0;
+    }
+}
+
+/* Menu text styles: normal labels, inverted selection, NFSU2-green
+ * accents (title, active tab, values) and dim hints. */
+enum { MS_NORMAL, MS_INVERT, MS_ACCENT, MS_DIM };
+static void menu_text_s(uint32_t x, uint32_t y, const char *s, int style)
+{
+    /* x, y in character cells (12x16 px each). Alpha stays 255. */
+    uint32_t cx = x * 12, cy = y * 16;
+    const uint8_t *g;
+    int xi, yi;
+    uint8_t fr, fg, fb, br, bg, bb;
+    switch (style) {
+    case MS_INVERT:
+        fr = fg = 10; fb = 22; br = bg = bb = 255;
+        break;
+    case MS_ACCENT:
+        fr = 170; fg = 255; fb = 120; br = bg = 10; bb = 22;
+        break;
+    case MS_DIM:
+        fr = fg = 130; fb = 150; br = bg = 10; bb = 22;
+        break;
+    default:
+        fr = fg = fb = 255; br = bg = 10; bb = 22;
+        break;
+    }
+    for (; *s && cx + 12 <= MENU_PW; s++, cx += 12) {
+        char c = *s;
+        uint32_t ox, oy;
+        uint8_t *p;
+        uint8_t r, gg, b;
+        if (c >= 'a' && c <= 'z') c -= (char)('a' - 'A');
+        g = font_get(c);
+        for (xi = 0; xi < 5; xi++) {
+            for (yi = 0; yi < 7; yi++) {
+                int bit = (g[xi] >> yi) & 1;
+                if (bit) { r = fr; gg = fg; b = fb; } else { r = br; gg = bg; b = bb; }
+                ox = cx + (uint32_t)xi * 2;
+                oy = cy + (uint32_t)yi * 2;
+                p = &s_menu_px[(oy * MENU_PW + ox) * 4];         p[0] = r; p[1] = gg; p[2] = b;
+                p = &s_menu_px[(oy * MENU_PW + ox + 1) * 4];     p[0] = r; p[1] = gg; p[2] = b;
+                p = &s_menu_px[((oy + 1) * MENU_PW + ox) * 4];   p[0] = r; p[1] = gg; p[2] = b;
+                p = &s_menu_px[((oy + 1) * MENU_PW + ox + 1) * 4]; p[0] = r; p[1] = gg; p[2] = b;
+            }
+        }
+    }
+}
+static void menu_build(void)
+{
+    uint8_t dark[4] = { 10, 10, 22, 255 }, lite[4] = { 255, 255, 255, 255 };
+    int i, li = 0, py, px, start, end, t, tx = 1;
+
+    for (py = 0; py < (int)MENU_PH; py++)
+        for (px = 0; px < (int)MENU_PW; px++)
+            memcpy(&s_menu_px[(py * MENU_PW + px) * 4],
+                   (px < 2 || py < 2 || px >= (int)MENU_PW - 2 || py >= (int)MENU_PH - 2) ? lite : dark, 4);
+    menu_text_s(1, 0, "SETTINGS - F1 CLOSES", MS_ACCENT);
+    /* Tab bar: the active tab in brackets and accent, the rest dim. */
+    for (t = 0, i = 0; i < (int)MENU_NROWS; i++) {
+        if (s_menu_rows[i].kind != MK_HEAD)
+            continue;
+        if (t == s_menu_tab) {
+            char tok[32];
+            snprintf(tok, sizeof tok, "[%s]", s_menu_rows[i].label);
+            menu_text_s((uint32_t)tx, 1, tok, MS_ACCENT);
+            tx += (int)strlen(tok) + 2;
+        } else {
+            menu_text_s((uint32_t)tx, 1, s_menu_rows[i].label, MS_DIM);
+            tx += (int)strlen(s_menu_rows[i].label) + 2;
+        }
+        t++;
+    }
+    /* Separator rule under the tabs. */
+    {
+        char sep[52];
+        memset(sep, '-', sizeof sep - 1);
+        sep[sizeof sep - 1] = 0;
+        menu_text_s(1, 2, sep, MS_DIM);
+    }
+    /* Only the active tab's rows; the value column goes in accent so the
+     * eye finds the settings at a glance. The selected row is accent text
+     * on the dark background, never an inverted (white) block: the menu
+     * bitmap is bilinearly upscaled to the window and bright backgrounds
+     * smear dark glyphs into mush. */
+    menu_tab_range(s_menu_tab, &start, &end);
+    for (i = start; i < end; i++) {
+        const MenuRow *r = &s_menu_rows[i];
+        char line[64], v[32];
+        int sel = (i == s_menu_sel);
+        if (r->kind == MK_HEAD) {
+            continue;
+        } else {
+            int n;
+            menu_value(r, v, sizeof v);
+            snprintf(line, sizeof line, "%s", r->label);
+            n = (int)strlen(line);
+            while (n < 34 && n < (int)sizeof line - 1)
+                line[n++] = '.';
+            line[n] = 0;
+            menu_text_s(1, (uint32_t)(li + 3), line, sel ? MS_ACCENT : MS_NORMAL);
+            menu_text_s(36, (uint32_t)(li + 3), v, MS_ACCENT);
+        }
+        li++;
+    }
+    if (s_menu_cap)
+        menu_text_s(1, (uint32_t)(li + 3), "PRESS A KEY (ESC CANCELS)", MS_ACCENT);
+    else {
+        menu_text_s(1, (uint32_t)(li + 3), "ARROWS MOVE ENTER SELECT TAB SECTION", MS_DIM);
+        menu_text_s(1, (uint32_t)(li + 4), "LEFT RIGHT ADJUST ESC QUIT", MS_DIM);
+    }
+}
+
+static int menu_scale_cur(void)
+{
+    double v = s_scale_pending ? s_scale_new : s_scale;
+    int k = (int)(v + 0.5);
+    return k < 1 ? 1 : k > 3 ? 3 : k;
+}
+
+static void menu_apply_scale(int k)
+{
+    char v[8];
+    if (k < 1) k = 1;
+    if (k > 3) k = 3;
+    snprintf(v, sizeof v, "%d", k);
+    xbox_CfgSet("SCALE", v);
+    s_scale_new = (double)k;
+    s_scale_pending = 1;
+    s_menu_dirty = 1;
+    fprintf(stderr, "  [VK] render scale x%d at the next frame\n", k);
+}
+
+static void menu_apply_vsync(int on)
+{
+    char v[8];
+    snprintf(v, sizeof v, "%d", on ? 1 : 0);
+    xbox_CfgSet("VSYNC", v);
+    s_vsync = on ? 1 : 0;
+    s_vsync_pending = 1;
+    s_menu_dirty = 1;
+    fprintf(stderr, "  [VK] vsync %s at the next frame\n", on ? "on" : "off");
+}
+
+static void menu_apply_volume(int v)
+{
+    char s[16];
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    xbox_AudioSetVolume100(v);
+    snprintf(s, sizeof s, "%d", v);
+    xbox_CfgSet("VOLUME", s);
+    s_menu_dirty = 1;
+}
+
+/* Anisotropy levels the menu cycles through, capped by the device limit. */
+static int menu_aniso_next(int cur, int dir)
+{
+    static const int lv[] = { 0, 2, 4, 8, 16 };
+    int i, n = 0;
+    for (i = 1; i < 5; i++)
+        if ((float)lv[i] <= s_max_aniso)
+            n = i;
+    /* n = highest available index; 0 (OFF) is always available. */
+    for (i = 0; i < 5; i++)
+        if (lv[i] == cur)
+            break;
+    if (i > n)
+        i = 0;
+    if (dir >= 0)
+        i = i >= n ? 0 : i + 1;
+    else
+        i = i <= 0 ? n : i - 1;
+    for (; i >= 0 && (float)lv[i] > s_max_aniso; i--)
+        ;
+    return lv[i < 0 ? 0 : i];
+}
+
+static void menu_apply_aniso(int a)
+{
+    char v[8];
+    if (a < 0) a = 0;
+    if (a > 16) a = 16;
+    s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 0;
+    if (s_aniso > 0 && (!s_have_aniso || (float)s_aniso > s_max_aniso))
+        s_aniso = s_have_aniso ? (int)s_max_aniso : 0;
+    snprintf(v, sizeof v, "%d", s_aniso);
+    xbox_CfgSet("ANISO", v);
+    s_menu_dirty = 1;
+    fprintf(stderr, "  [VK] anisotropic filtering %s\n",
+            s_aniso ? v : "off");
+}
+
+static void menu_move(int dir)
+{
+    int i = s_menu_sel, start, end;
+    menu_tab_range(s_menu_tab, &start, &end);
+    do {
+        i += dir;
+        if (i < start) i = end - 1;
+        if (i >= end) i = start;
+    } while (s_menu_rows[i].kind == MK_HEAD);
+    s_menu_sel = i;
+    s_menu_dirty = 1;
+}
+
+static void menu_adjust(int dir)
+{
+    const MenuRow *r = &s_menu_rows[s_menu_sel];
+    if (r->kind == MK_SCALE) {
+        int k = menu_scale_cur() + dir;
+        menu_apply_scale(k < 1 ? 3 : k > 3 ? 1 : k);
+    } else if (r->kind == MK_ANISO) {
+        menu_apply_aniso(menu_aniso_next(s_aniso, dir));
+    } else if (r->kind == MK_VSYNC) {
+        menu_apply_vsync(!s_sc_vsync);
+    } else if (r->kind == MK_VOL) {
+        menu_apply_volume(xbox_AudioGetVolume100() + dir * 5);
+    }
+}
+
+static void menu_activate(void)
+{
+    const MenuRow *r = &s_menu_rows[s_menu_sel];
+    if (r->kind == MK_SCALE) {
+        int k = menu_scale_cur() + 1;
+        menu_apply_scale(k > 3 ? 1 : k);
+    } else if (r->kind == MK_ANISO) {
+        menu_apply_aniso(menu_aniso_next(s_aniso, 1));
+    } else if (r->kind == MK_VSYNC) {
+        menu_apply_vsync(!s_sc_vsync);
+    } else if (r->kind == MK_KEY) {
+        s_menu_cap = 1;
+        s_menu_cap_row = s_menu_sel;
+    } else if (r->kind == MK_KEY2) {
+        s_menu_cap = 2;
+        s_menu_cap_row = s_menu_sel;
+    } else if (r->kind == MK_KEYRESET) {
+        xbox_KbOverrideClear();
+        xbox_KbSave();
+    }
+    s_menu_dirty = 1;
+}
+
+/* One key while the menu is open (F1/Escape handled by the pump). */
+static void menu_key(SDL_Scancode sc, SDL_Keycode sym)
+{
+    if (s_menu_cap) {
+        const MenuRow *r;
+        if (sym == SDLK_ESCAPE) {
+            s_menu_cap = 0;
+        } else {
+            r = &s_menu_rows[s_menu_cap_row];
+            xbox_KbOverrideSet(s_menu_cap == 3 ? r->vk2 : r->vk, (int)sc);
+            if (r->kind == MK_KEY2 && s_menu_cap == 2)
+                s_menu_cap = 3;
+            else {
+                s_menu_cap = 0;
+                xbox_KbSave();
+            }
+        }
+        s_menu_dirty = 1;
+        return;
+    }
+    switch (sc) {
+    case SDL_SCANCODE_UP: menu_move(-1); break;
+    case SDL_SCANCODE_DOWN: menu_move(1); break;
+    case SDL_SCANCODE_LEFT: menu_adjust(-1); break;
+    case SDL_SCANCODE_RIGHT: menu_adjust(1); break;
+    case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: menu_activate(); break;
+    case SDL_SCANCODE_TAB: menu_tab_goto(s_menu_tab + 1); break;
+    case SDL_SCANCODE_ESCAPE: xbox_MenuToggle(); break;
+    default: break;
+    }
+    s_menu_dirty = 1;
+}
+
+static int menu_blit_format(void)
+{
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(s_pd, VK_FORMAT_R8G8B8A8_UNORM, &fp);
+    if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)
+        return 0;
+    return 1;                       /* fall back to the surface format */
+}
+
+/* The panel over the presented frame, after the frame's own blit. dst is
+ * still TRANSFER_DST_OPTIMAL here. */
+static void menu_draw(VkImage dst)
+{
+    VkDeviceSize size = (VkDeviceSize)MENU_PW * MENU_PH * 4;
+    void *staging;
+    VkDeviceSize at;
+    VkBufferImageCopy rg;
+    VkImageMemoryBarrier ib;
+    VkImageBlit bl;
+    uint32_t dw = MENU_PW, dh = MENU_PH;
+
+    {
+        static int was_open, reported;
+        int open = xbox_MenuOpen();
+        if (open && !was_open)
+            s_menu_dirty = 1;
+        was_open = open;
+        if (!open || s_headless)
+            return;
+        if (!reported) {
+            reported = 1;
+            fprintf(stderr, "  [MENU] drawing, extent %ux%u\n",
+                    s_sc_extent.width, s_sc_extent.height);
+        }
+    }
+    if (!s_menu_px) {
+        s_menu_px = (uint8_t *)malloc((size_t)size);
+        if (!s_menu_px)
+            return;
+        s_menu_dirty = 1;
+    }
+    if (!s_menu_img) {
+        VkFormat fmt = menu_blit_format() ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
+        /* SAMPLED too: make_image always builds the view, and a view needs
+         * the image to allow more than transfers. */
+        if (!make_image(MENU_PW, MENU_PH, fmt,
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &s_menu_img, &s_menu_view, &s_menu_mem))
+            return;
+        /* A fresh image starts UNDEFINED: take it to GENERAL once. */
+        memset(&ib, 0, sizeof ib);
+        ib.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        ib.srcAccessMask = 0;
+        ib.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib.image = s_menu_img;
+        ib.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ib.subresourceRange.layerCount = 1;
+        ib.subresourceRange.levelCount = 1;
+        vkCmdPipelineBarrier(s_cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+        s_menu_dirty = 1;
+    }
+    if (s_menu_dirty) {
+        menu_build();
+        at = ring_alloc(size, 16, &staging);
+        if (!staging)
+            return;                 /* ring full mid-frame: skip this one */
+        memcpy(staging, s_menu_px, (size_t)size);
+        end_rendering();
+        barrier_all();
+        memset(&rg, 0, sizeof rg);
+        rg.bufferOffset = at;
+        rg.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rg.imageSubresource.layerCount = 1;
+        rg.imageExtent.width = MENU_PW;
+        rg.imageExtent.height = MENU_PH;
+        rg.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(s_cb, s_f->ring, s_menu_img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+        s_menu_dirty = 0;
+    }
+    if (dw + 48 > s_sc_extent.width || dh + 48 > s_sc_extent.height) {
+        double f = (double)(s_sc_extent.width - 48) / dw;
+        double g = (double)(s_sc_extent.height - 48) / dh;
+        if (g < f) f = g;
+        if (f < 0.25) f = 0.25;
+        dw = (uint32_t)(dw * f);
+        dh = (uint32_t)(dh * f);
+    }
+    memset(&bl, 0, sizeof bl);
+    bl.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    bl.srcSubresource.layerCount = 1;
+    bl.srcOffsets[1].x = (int32_t)MENU_PW;
+    bl.srcOffsets[1].y = (int32_t)MENU_PH;
+    bl.srcOffsets[1].z = 1;
+    bl.dstSubresource = bl.srcSubresource;
+    bl.dstOffsets[0].x = 24;
+    bl.dstOffsets[0].y = 24;
+    bl.dstOffsets[1].x = 24 + (int32_t)dw;
+    bl.dstOffsets[1].y = 24 + (int32_t)dh;
+    bl.dstOffsets[1].z = 1;
+    end_rendering();
+    barrier_all();
+    vkCmdBlitImage(s_cb, s_menu_img, VK_IMAGE_LAYOUT_GENERAL, dst,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+}
+#endif
 
 static void vk_flip(void)
 {
@@ -3307,6 +4450,23 @@ static void vk_flip(void)
                 vkCmdBlitImage(s_cb, s->image, VK_IMAGE_LAYOUT_GENERAL, dst,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
             }
+#if !defined(__SWITCH__) && !defined(_WIN32)
+            {
+                /* RECOMP_MENU_OPEN=1 starts with the settings menu open, to
+                 * look at it without a keyboard plugged in. */
+                static int mo = -1;
+                if (mo < 0) {
+                    const char *e;
+                    mo = 0;
+                    e = getenv("RECOMP_MENU_OPEN");
+                    if (e && *e && *e != '0') {
+                        xbox_MenuToggle();
+                        fprintf(stderr, "  [MENU] opened at boot, open=%d\n", xbox_MenuOpen());
+                    }
+                }
+            }
+            menu_draw(dst);
+#endif
             b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             b.dstAccessMask = 0;
             b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -3324,7 +4484,7 @@ static void vk_flip(void)
         si.pWaitSemaphores = &s_f->acquired;
         si.pWaitDstStageMask = &ws;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &s_f->rendered;
+        si.pSignalSemaphores = &s_rend[idx];
     }
     if (vkQueueSubmit(s_queue, 1, &si, s_f->fence) != VK_SUCCESS)
         LOGE("vkQueueSubmit failed\n");
@@ -3333,7 +4493,7 @@ static void vk_flip(void)
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         VkResult pr;
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &s_f->rendered;
+        pi.pWaitSemaphores = &s_rend[idx];
         pi.swapchainCount = 1;
         pi.pSwapchains = &s_swapchain;
         pi.pImageIndices = &idx;
@@ -3357,11 +4517,9 @@ static void vk_flip(void)
     frame_begin();
     VT("flip %u: next frame recording\n", s_frame);
     s_dyn_valid = 0;
-#if !defined(__SWITCH__)
-    if (s_win) {
-        SDL_Event e;
-        while (SDL_PollEvent(&e)) { }
-    }
+#if !defined(__SWITCH__) && !defined(__APPLE__)
+    if (s_win)
+        pump_events();
 #endif
 }
 
@@ -3382,4 +4540,22 @@ void nv2a_vk_install(void)
 {
     nv2a_backend_register(&s_backend);
     fprintf(stderr, "[BOOT] NV2A Vulkan renderer registered\n");
+}
+
+/* macOS wants the window (and the NSApplication behind it) created on the
+ * process' main thread, and that thread to pump the events afterwards --
+ * the executor thread runs ready() and vk_flip otherwise. main.c calls
+ * nv2a_vk_ready() before the title starts and nv2a_vk_pump() while it runs;
+ * everywhere else ready() stays lazy and this pair costs nothing. */
+int nv2a_vk_ready(void)
+{
+    return ready();
+}
+
+void nv2a_vk_pump(void)
+{
+#if !defined(__SWITCH__)
+    if (s_win)
+        pump_events();
+#endif
 }

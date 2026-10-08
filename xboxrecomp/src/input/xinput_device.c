@@ -14,16 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ======================================================================== */
-#if defined(_WIN32)
-/* ====================  XInput backend  ================================== */
-/* ======================================================================== */
-
-#include <xinput.h>
-#pragma comment(lib, "xinput.lib")
-
-static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
-static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+/* The keyboard stand-in lives above the platform halves: only where the
+ * keys come from differs (the framebuffer window on Windows, SDL on the
+ * others), see xbox_FramebufferKeyDown in each. */
 
 /* ---- keyboard, when there is no pad --------------------------------------
  *
@@ -32,10 +25,10 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
  * The whole point of a recompilation is to be able to look at the thing
  * running, and a build nobody can press a button in cannot be looked at.
  *
- * Off by default, because a keyboard silently acting as player 1 is
- * surprising when a real pad is what you meant to use. RECOMP_KEYBOARD=1
- * turns it on. It only ever answers for port 0, and is merged on top of a
- * pad connected there, so a real controller keeps working.
+ * On by default, RECOMP_KEYBOARD=0 to turn it off. It is merged on top of
+ * whatever pad is on port 0 rather than replacing it, so with no key held
+ * it does nothing and a real controller keeps working. It only ever
+ * answers for port 0.
  *
  * The keys are the ones a Dreamcast or Saturn emulator would pick, which is
  * the closest thing to a convention here:
@@ -45,15 +38,17 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
  *   Q E           white black       1 3        triggers
  *   numpad 8/2/4/6 left thumb       I/K/J/L    right thumb
  *
- * Keys come from the framebuffer window, which only receives them while it
- * has the focus, so typing in another window does not drive the game.
+ * Keys come from the window that has the focus, so typing in another
+ * application does not drive the game: xbox_FramebufferKeyDown reads the
+ * framebuffer window on Windows and SDL's keyboard state elsewhere (F1
+ * shows this table; RECOMP_KEY_TRACE=1 logs every key that arrives).
  */
 static BOOL keyboard_enabled(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *v = getenv("RECOMP_KEYBOARD");
-        on = (v && *v && *v != '0') ? 1 : 0;
+        on = (!v || !*v || *v != '0') ? 1 : 0;
     }
     return on ? TRUE : FALSE;
 }
@@ -90,6 +85,12 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     WORD b = 0;
 
     memset(pState, 0, sizeof(*pState));
+    /* The packet number has to move for every answer: the title's input
+     * layer looks for button edges, so an unchanged number reads as the
+     * same state and a press is never noticed. */
+    pState->dwPacketNumber = ++packet;
+    if (xbox_MenuOpen())
+        return;                     /* F1 menu open: hold the pad still */
 
     if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
     if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
@@ -118,11 +119,73 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbLY = axis_from_keys(VK_NUMPAD2, VK_NUMPAD8);
     pState->Gamepad.sThumbRX = axis_from_keys('J', 'L');
     pState->Gamepad.sThumbRY = axis_from_keys('K', 'I');
-
-    /* The title's input layer looks for button edges, so the packet number
-     * has to move whenever the state does or a press is never noticed. */
-    pState->dwPacketNumber = ++packet;
 }
+
+/* The keyboard merged on top of whatever pad answered, rather than only
+ * standing in for a missing one.
+ *
+ * The first version put the keyboard behind XInput's failure, on the
+ * assumption that with nothing plugged in the call would fail. It does not:
+ * under Wine XInputGetState returns ERROR_SUCCESS and a gamepad with every
+ * button at rest, so the fallback was unreachable and pressing a key did
+ * nothing at all.
+ *
+ * Merging is also the better rule. A real pad keeps working -- its buttons
+ * are already in pState and the keyboard only adds to them -- and there is
+ * no special case left to get wrong. */
+static void merge_keyboard(XBOX_INPUT_STATE *pState)
+{
+    XBOX_INPUT_STATE kb;
+    int i;
+
+    if (!keyboard_enabled())
+        return;
+    keyboard_state(&kb);
+    pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
+    for (i = 0; i < 8; i++)
+        if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+            pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+    if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
+    if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
+    if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
+    if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
+    /* The input layer records edges, so an unchanged packet number is read
+     * as the same state and the press never happens. */
+    pState->dwPacketNumber = kb.dwPacketNumber;
+}
+
+/* The F1 settings menu (drawn by the Vulkan renderer): while it is open the
+ * keyboard holds the pad still, so moving through the menu does not also
+ * drive the title. The flag lives here, next to the keyboard, so no
+ * renderer has to be linked for the input layer to ask it. */
+static int s_menu_open;
+
+int xbox_MenuOpen(void)
+{
+    return s_menu_open;
+}
+
+void xbox_MenuToggle(void)
+{
+    s_menu_open = !s_menu_open;
+}
+
+/* ======================================================================== */
+#if defined(_WIN32)
+/* ====================  XInput backend  ================================== */
+/* ======================================================================== */
+
+#include <xinput.h>
+#pragma comment(lib, "xinput.lib")
+
+static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
+static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+
+/* The window pump's key events go to the SDL side; here the framebuffer
+ * window records the keys itself (fb_present.c). */
+void xbox_KeyState(int scancode, int down) { (void)scancode; (void)down; }
+void xbox_KeyClear(void) { }
+
 
 void xbox_InputInit(void)
 {
@@ -190,22 +253,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
      * Merging is also the better rule. A real pad keeps working -- its
      * buttons are already in pState and the keyboard only adds to them --
      * and there is no special case left to get wrong. */
-    if (dwPort == 0 && keyboard_enabled()) {
-        XBOX_INPUT_STATE kb;
-        int i;
-        keyboard_state(&kb);
-        pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
-        for (i = 0; i < 8; i++)
-            if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
-                pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
-        if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
-        if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
-        if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
-        if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
-        /* The input layer records edges, so an unchanged packet number is
-         * read as the same state and the press never happens. */
-        pState->dwPacketNumber = kb.dwPacketNumber;
-    }
+    /* Merge the keyboard on top rather than only standing in for a missing
+     * pad; see merge_keyboard(). */
+    if (dwPort == 0)
+        merge_keyboard(pState);
 
     return ERROR_SUCCESS;
 }
@@ -252,6 +303,149 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ======================================================================== */
 
 #include <SDL.h>
+#include <stdio.h>
+#include "platform/xbox_cfg.h"
+
+/* Remapped keys (the F1 menu): per VK code a replacement SDL scancode, or
+ * -1 for the default table that keyboard_state() documents above. Stored as
+ * KB_<vk>=<sc> in the cfg file. */
+static int s_kb_sc[256];
+static unsigned char s_kb_touched[256];
+static int s_kb_inited;
+
+static void kb_init(void)
+{
+    int i;
+    if (s_kb_inited)
+        return;
+    s_kb_inited = 1;
+    for (i = 0; i < 256; i++)
+        s_kb_sc[i] = -1;
+}
+
+int xbox_KbOverrideGet(int vk)
+{
+    kb_init();
+    if (vk < 0 || vk > 255)
+        return -1;
+    return s_kb_sc[vk];
+}
+
+void xbox_KbOverrideSet(int vk, int scancode)
+{
+    kb_init();
+    if (vk < 0 || vk > 255)
+        return;
+    s_kb_sc[vk] = (scancode >= 0 && scancode < (int)SDL_NUM_SCANCODES) ? scancode : -1;
+    s_kb_touched[vk] = 1;
+}
+
+void xbox_KbOverrideClear(void)
+{
+    int i;
+    kb_init();
+    for (i = 0; i < 256; i++) {
+        s_kb_sc[i] = -1;
+        s_kb_touched[i] = 1;
+    }
+}
+
+void xbox_KbLoad(void)
+{
+    char v[16], key[16];
+    int vk;
+    kb_init();
+    for (vk = 0; vk < 256; vk++) {
+        int sc;
+        snprintf(key, sizeof key, "KB_%d", vk);
+        if (!xbox_CfgGet(key, v, sizeof v))
+            continue;
+        sc = atoi(v);
+        if (sc >= 0 && sc < (int)SDL_NUM_SCANCODES)
+            s_kb_sc[vk] = sc;
+    }
+}
+
+void xbox_KbSave(void)
+{
+    char key[16], v[16];
+    int vk;
+    kb_init();
+    /* -1 included: a reset must also erase a binding the file remembers. */
+    for (vk = 0; vk < 256; vk++)
+        if (s_kb_touched[vk]) {
+            snprintf(key, sizeof key, "KB_%d", vk);
+            snprintf(v, sizeof v, "%d", s_kb_sc[vk]);
+            xbox_CfgSet(key, v);
+        }
+}
+
+/* Where the keys come from on this side: the window's own event pump,
+ * which records every key as it arrives (xbox_KeyState, called by the
+ * renderer's pump) and forgets them when the window loses the focus.
+ * SDL's keyboard state is read too, as a second opinion for pumps that do
+ * not report (the GL renderer's). Only the focused window produces
+ * events, so typing in another application does not drive the title.
+ *
+ * The VK codes are Windows' (win32_compat.h), so the table in
+ * keyboard_state() above reads the same on every platform. The keypad keys
+ * also answer on the number row: most laptops have no numeric keypad, and
+ * 2/4/6/8 are unused there (1 and 3 are the triggers). */
+static volatile unsigned char s_key_down[SDL_NUM_SCANCODES];
+
+void xbox_KeyState(int scancode, int down)
+{
+    if (scancode > 0 && scancode < SDL_NUM_SCANCODES)
+        s_key_down[scancode] = down ? 1 : 0;
+}
+
+void xbox_KeyClear(void)
+{
+    int i;
+    for (i = 0; i < SDL_NUM_SCANCODES; i++)
+        s_key_down[i] = 0;
+}
+
+int xbox_FramebufferKeyDown(int vk)
+{
+    const Uint8 *k;
+    SDL_Scancode sc[3];
+    int n = 0, i;
+
+    k = (SDL_WasInit(0) != 0) ? SDL_GetKeyboardState(NULL) : NULL;
+    kb_init();
+    if (vk >= 0 && vk <= 255 && s_kb_sc[vk] >= 0) {
+        int o = s_kb_sc[vk];
+        return (s_key_down[o] || (k && k[o])) ? 1 : 0;
+    }
+    switch (vk) {
+    case VK_BACK:    sc[n++] = SDL_SCANCODE_BACKSPACE; break;
+    case VK_RETURN:  sc[n++] = SDL_SCANCODE_RETURN; sc[n++] = SDL_SCANCODE_KP_ENTER; break;
+    case VK_SHIFT:   sc[n++] = SDL_SCANCODE_LSHIFT; sc[n++] = SDL_SCANCODE_RSHIFT; break;
+    case VK_CONTROL: sc[n++] = SDL_SCANCODE_LCTRL;  sc[n++] = SDL_SCANCODE_RCTRL; break;
+    case VK_LEFT:    sc[n++] = SDL_SCANCODE_LEFT; break;
+    case VK_UP:      sc[n++] = SDL_SCANCODE_UP; break;
+    case VK_RIGHT:   sc[n++] = SDL_SCANCODE_RIGHT; break;
+    case VK_DOWN:    sc[n++] = SDL_SCANCODE_DOWN; break;
+    case VK_NUMPAD2: sc[n++] = SDL_SCANCODE_KP_2; sc[n++] = SDL_SCANCODE_2; break;
+    case VK_NUMPAD4: sc[n++] = SDL_SCANCODE_KP_4; sc[n++] = SDL_SCANCODE_4; break;
+    case VK_NUMPAD6: sc[n++] = SDL_SCANCODE_KP_6; sc[n++] = SDL_SCANCODE_6; break;
+    case VK_NUMPAD8: sc[n++] = SDL_SCANCODE_KP_8; sc[n++] = SDL_SCANCODE_8; break;
+    default:
+        if (vk >= 'A' && vk <= 'Z')
+            sc[n++] = (SDL_Scancode)(SDL_SCANCODE_A + (vk - 'A'));
+        else if (vk == '0')
+            sc[n++] = SDL_SCANCODE_0;
+        else if (vk >= '1' && vk <= '9')
+            sc[n++] = (SDL_Scancode)(SDL_SCANCODE_1 + (vk - '1'));
+        else
+            return 0;
+    }
+    for (i = 0; i < n; i++)
+        if (s_key_down[sc[i]] || (k && k[sc[i]]))
+            return 1;
+    return 0;
+}
 
 static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
@@ -276,6 +470,7 @@ void xbox_InputInit(void)
 {
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
+    xbox_KbLoad();                  /* the F1 menu's remapped keys, if any */
     open_controllers();
 }
 
@@ -317,6 +512,11 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
+        /* Nothing plugged in: RECOMP_KEYBOARD answers for the keyboard. */
+        if (dwPort == 0 && keyboard_enabled()) {
+            keyboard_state(pState);
+            return ERROR_SUCCESS;
+        }
         return ERROR_DEVICE_NOT_CONNECTED;
     }
 
@@ -364,6 +564,10 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRX = SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTX);
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
+
+    /* The keyboard on top of a real pad, so both work at once. */
+    if (dwPort == 0)
+        merge_keyboard(pState);
 
     return ERROR_SUCCESS;
 }

@@ -32,6 +32,21 @@ void xa2_set_master_volume(float v)
     g_xa2_volume = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
 }
 
+static int s_volume_pct = 50;
+
+void xbox_AudioSetVolume100(int pct)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    s_volume_pct = pct;
+    xa2_set_master_volume((float)pct / 100.0f);
+}
+
+int xbox_AudioGetVolume100(void)
+{
+    return s_volume_pct;
+}
+
 /* The XAudio2 backend is Windows-only; on other hosts the same xa2_* calls
  * are served by SDL2 audio (below). */
 #if defined(_WIN32)
@@ -248,6 +263,7 @@ void xa2_get_stats(Xa2Stats *out)
 
 #include <stdlib.h>
 #include <SDL.h>
+#include "platform/xbox_cfg.h"
 
 #define SDLA_SAMPLE_RATE   48000
 #define SDLA_CHANNELS      2
@@ -282,7 +298,13 @@ int xa2_init(void)
     e = getenv("RECOMP_AUDIO_BLOCKS");
     if (e && atoi(e) >= 2 && atoi(e) <= 64) g_sdla_target = atoi(e);
     e = getenv("RECOMP_AUDIO_VOLUME");
-    if (e) xa2_set_master_volume((float)atoi(e) / 100.0f);
+    if (e) {
+        xbox_AudioSetVolume100(atoi(e));
+    } else {
+        char v[16];
+        if (xbox_CfgGet("VOLUME", v, sizeof v))
+            xbox_AudioSetVolume100(atoi(v));
+    }
 
     if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
         fprintf(stderr, "[AUDIO] SDL audio init failed: %s\n", SDL_GetError());
