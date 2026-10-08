@@ -291,6 +291,7 @@ RECOMP_WIDESCREEN=0
 | `RECOMP_PB_EXEC` | Execute the NV2A pushbuffer (default 1; the title draws through it). |
 | `RECOMP_GL_SCALE` | Render resolution multiple, 0.5..4 (fractions allowed). The F1 menu switches x1/x2/x3 live. |
 | `RECOMP_VSYNC=0` | Present without waiting for vblank (the menu's VSYNC does the same live). |
+| `RECOMP_ANISO` | Anisotropic filtering 0/2/4/8/16, 0 off (the menu's ANISO does the same live). |
 | `RECOMP_MENU_OPEN=1` | Start with the F1 settings menu open. |
 | `RECOMP_GL_THREAD=1` | GL renderer: GL calls on their own thread. |
 | `RECOMP_GL_DIRECT=0` | Convert every vertex to float4 instead of uploading it as stored. |

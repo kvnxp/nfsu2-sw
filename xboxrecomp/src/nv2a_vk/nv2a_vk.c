@@ -106,7 +106,14 @@ static VkPhysicalDeviceMemoryProperties s_memprops;
 static VkDeviceSize     s_ubo_align = 256;
 static uint32_t         s_ubo_range = 16384;
 static VkFormat         s_depth_fmt = VK_FORMAT_D24_UNORM_S8_UINT;
-static int              s_have_bc, s_have_depth_clamp;
+static int              s_have_bc, s_have_depth_clamp, s_have_aniso;
+static float            s_max_aniso = 1.0f;
+/* Anisotropic filtering level (0 off, else 2/4/8/16, clamped to the device
+ * limit): sharpens road and ground textures at grazing angles, the classic
+ * image-quality win for racing games. Env RECOMP_ANISO wins, else cfg
+ * ANISO, else off. Changing it only affects samplers created afterwards;
+ * the level is part of the sampler cache key, so old samplers age out. */
+static int              s_aniso = 0;
 
 static PFN_vkCmdPushDescriptorSetKHR  p_push_desc;
 static PFN_vkCmdSetVertexInputEXT     p_vertex_input;
@@ -1108,6 +1115,12 @@ static VkSampler sampler_get(uint32_t key)
     ci.minFilter = (key & 0x20000) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     ci.maxLod = 0.0f;
+    if (s_have_aniso && s_aniso > 0) {
+        float a = (float)s_aniso;
+        if (a > s_max_aniso) a = s_max_aniso;
+        ci.anisotropyEnable = VK_TRUE;
+        ci.maxAnisotropy = a;
+    }
     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     if (s_nsamplers == 64)
         s_nsamplers = 0;                    /* never in practice: 4 x 4 x 4 keys */
@@ -1211,6 +1224,12 @@ static void bind_stage(const uint32_t *regs, int i, float scale[2], VkDescriptor
     key = (addr & 0xF0F);
     if (((filter >> 24) & 0xF) == 1) key |= 0x10000;
     if (((filter >> 16) & 0xFF) == 1) key |= 0x20000;
+    /* The anisotropy level rides in the key so a menu change takes effect
+     * on the next draw without flushing the sampler cache. */
+    if (s_aniso > 0) {
+        int idx = s_aniso >= 16 ? 4 : s_aniso >= 8 ? 3 : s_aniso >= 4 ? 2 : 1;
+        key |= (uint32_t)idx << 20;
+    }
     out->sampler = sampler_get(key);
 }
 
@@ -2232,6 +2251,40 @@ static int ready(void)
     vkGetPhysicalDeviceFeatures(s_pd, &have);
     s_have_bc = have.textureCompressionBC;
     s_have_depth_clamp = have.depthClamp;
+    s_have_aniso = have.samplerAnisotropy;
+    s_max_aniso = pp.limits.maxSamplerAnisotropy;
+    if (s_max_aniso > 16.0f) s_max_aniso = 16.0f;
+    if (s_max_aniso < 1.0f) s_max_aniso = 1.0f;
+    {
+        /* Anisotropic filtering level: 0 off, else 2/4/8/16, clamped to
+         * the device limit. Env RECOMP_ANISO wins, else cfg ANISO, else
+         * off. The level rides in the sampler cache key (bind_stage), so
+         * a menu change takes effect on the next draw with no flush. */
+        const char *e = getenv("RECOMP_ANISO");
+#if !defined(_WIN32)
+        char v[16];
+#endif
+        int a = 0;
+        if (e)
+            a = atoi(e);
+#if !defined(_WIN32)
+        else if (xbox_CfgGet("ANISO", v, sizeof v))
+            a = atoi(v);
+#endif
+        if (a < 0) a = 0;
+        if (a > 16) a = 16;
+        /* Snap to a real level so the sampler cache key stays small. */
+        s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 0;
+        if (s_aniso > 0) {
+            if (!s_have_aniso)
+                s_aniso = 0;
+            else if ((float)s_aniso > s_max_aniso)
+                s_aniso = (int)s_max_aniso;
+            if (s_aniso > 0)
+                fprintf(stderr, "  [VK] anisotropic filtering x%d (of %.0f)\n",
+                        s_aniso, s_max_aniso);
+        }
+    }
     {
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(s_pd, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
@@ -2338,6 +2391,7 @@ static int ready(void)
         f2.pNext = &f13;
         f2.features.textureCompressionBC = s_have_bc ? VK_TRUE : VK_FALSE;
         f2.features.depthClamp = s_have_depth_clamp ? VK_TRUE : VK_FALSE;
+        f2.features.samplerAnisotropy = s_have_aniso ? VK_TRUE : VK_FALSE;
 
         ndext = 0;
         if (!s_headless)
@@ -3694,13 +3748,17 @@ static const uint8_t *font_get(char c)
     return s_font_data[p - s_font_chars];
 }
 
-enum { MK_HEAD, MK_SCALE, MK_VSYNC, MK_KEY, MK_KEY2, MK_KEYRESET, MK_VOL };
+enum { MK_HEAD, MK_SCALE, MK_ANISO, MK_VSYNC, MK_KEY, MK_KEY2, MK_KEYRESET, MK_VOL };
 typedef struct { int kind; const char *label; int vk, vk2, d1, d2; } MenuRow;
 static const MenuRow s_menu_rows[] = {
     { MK_HEAD, "GRAPHICS", 0, 0, 0, 0 },
     { MK_SCALE, "SCALE", 0, 0, 0, 0 },
+    { MK_ANISO, "ANISO", 0, 0, 0, 0 },
+    { MK_HEAD, "VIDEO", 0, 0, 0, 0 },
     { MK_VSYNC, "VSYNC", 0, 0, 0, 0 },
-    { MK_HEAD, "KEYBOARD - ENTER TO CHANGE", 0, 0, 0, 0 },
+    { MK_HEAD, "AUDIO", 0, 0, 0, 0 },
+    { MK_VOL, "VOLUME", 0, 0, 0, 0 },
+    { MK_HEAD, "CONTROLLER", 0, 0, 0, 0 },
     { MK_KEY, "UP", MVK_UP, -1, SDL_SCANCODE_UP, -1 },
     { MK_KEY, "DOWN", MVK_DOWN, -1, SDL_SCANCODE_DOWN, -1 },
     { MK_KEY, "LEFT", MVK_LEFT, -1, SDL_SCANCODE_LEFT, -1 },
@@ -3722,8 +3780,6 @@ static const MenuRow s_menu_rows[] = {
     { MK_KEY2, "RIGHT STICK X", 'J', 'L', SDL_SCANCODE_J, SDL_SCANCODE_L },
     { MK_KEY2, "RIGHT STICK Y", 'K', 'I', SDL_SCANCODE_K, SDL_SCANCODE_I },
     { MK_KEYRESET, "RESET KEYBOARD", 0, 0, 0, 0 },
-    { MK_HEAD, "AUDIO", 0, 0, 0, 0 },
-    { MK_VOL, "VOLUME", 0, 0, 0, 0 },
 };
 #define MENU_NROWS (sizeof s_menu_rows / sizeof s_menu_rows[0])
 #define MENU_COLS 52
@@ -3731,6 +3787,7 @@ static const MenuRow s_menu_rows[] = {
 #define MENU_PH (32 * 16)
 
 static int s_menu_sel = 1;      /* selected row; headers are skipped */
+static int s_menu_tab = 0;      /* active tab: the Nth MK_HEAD section */
 static int s_menu_cap;          /* 0 none, 1 one key, 2 axis negative, 3 axis positive */
 static int s_menu_cap_row;
 static int s_menu_dirty = 1;
@@ -3738,6 +3795,49 @@ static VkImage s_menu_img;
 static VkImageView s_menu_view;
 static VkDeviceMemory s_menu_mem;
 static uint8_t *s_menu_px;
+
+/* Tabs are the MK_HEAD sections (GRAPHICS, VIDEO, AUDIO, CONTROLLER):
+ * menu_tab_range fills [start, end) with the row span of one tab. */
+static int menu_tab_count(void)
+{
+    int i, n = 0;
+    for (i = 0; i < (int)MENU_NROWS; i++)
+        if (s_menu_rows[i].kind == MK_HEAD)
+            n++;
+    return n ? n : 1;
+}
+static void menu_tab_range(int tab, int *start, int *end)
+{
+    int i, n = -1;
+    *start = 0;
+    *end = (int)MENU_NROWS;
+    for (i = 0; i < (int)MENU_NROWS; i++) {
+        if (s_menu_rows[i].kind != MK_HEAD)
+            continue;
+        n++;
+        if (n == tab)
+            *start = i;
+        else if (n == tab + 1) {
+            *end = i;
+            return;
+        }
+    }
+}
+static void menu_tab_goto(int tab)
+{
+    int start, end, i, n;
+    n = menu_tab_count();
+    tab %= n;
+    if (tab < 0) tab += n;
+    s_menu_tab = tab;
+    menu_tab_range(tab, &start, &end);
+    for (i = start; i < end; i++)
+        if (s_menu_rows[i].kind != MK_HEAD) {
+            s_menu_sel = i;
+            break;
+        }
+    s_menu_dirty = 1;
+}
 
 /* A scancode's name in the font's alphabet (uppercase ASCII, '?' else).
  * "Keypad 4" becomes "KP 4": the panel is 52 columns wide. */
@@ -3781,6 +3881,18 @@ static void menu_value(const MenuRow *r, char *out, size_t cap)
     }
     case MK_VSYNC:
         snprintf(out, cap, "%s", s_sc_vsync ? "ON" : "OFF");
+        return;
+    case MK_ANISO:
+        if (s_aniso >= 16)
+            snprintf(out, cap, "X16");
+        else if (s_aniso >= 8)
+            snprintf(out, cap, "X8");
+        else if (s_aniso >= 4)
+            snprintf(out, cap, "X4");
+        else if (s_aniso >= 2)
+            snprintf(out, cap, "X2");
+        else
+            snprintf(out, cap, "OFF");
         return;
     case MK_VOL:
         snprintf(out, cap, "%d", xbox_AudioGetVolume100());
@@ -3834,18 +3946,28 @@ static void menu_text(uint32_t x, uint32_t y, const char *s, int inv)
 static void menu_build(void)
 {
     uint8_t dark[4] = { 10, 10, 22, 255 }, lite[4] = { 255, 255, 255, 255 };
-    int i, li = 0, py, px;
+    int i, li = 0, py, px, start, end, t, tx = 1;
 
     for (py = 0; py < (int)MENU_PH; py++)
         for (px = 0; px < (int)MENU_PW; px++)
             memcpy(&s_menu_px[(py * MENU_PW + px) * 4],
                    (px < 2 || py < 2 || px >= (int)MENU_PW - 2 || py >= (int)MENU_PH - 2) ? lite : dark, 4);
     menu_text(1, 0, "SETTINGS - F1 CLOSES", 0);
-    for (i = 0; i < (int)MENU_NROWS; i++) {
+    /* Tab bar: one cell per section, active tab inverted. */
+    for (t = 0, i = 0; i < (int)MENU_NROWS; i++) {
+        if (s_menu_rows[i].kind != MK_HEAD)
+            continue;
+        menu_text((uint32_t)tx, 1, s_menu_rows[i].label, t == s_menu_tab ? 1 : 0);
+        tx += (int)strlen(s_menu_rows[i].label) + 3;
+        t++;
+    }
+    /* Only the active tab's rows. */
+    menu_tab_range(s_menu_tab, &start, &end);
+    for (i = start; i < end; i++) {
         const MenuRow *r = &s_menu_rows[i];
         char line[64], v[32];
         if (r->kind == MK_HEAD) {
-            snprintf(line, sizeof line, "%s", r->label);
+            continue;
         } else {
             int n;
             menu_value(r, v, sizeof v);
@@ -3856,14 +3978,14 @@ static void menu_build(void)
             line[n] = 0;
             snprintf(line + n, sizeof line - (size_t)n, " %s", v);
         }
-        menu_text(1, (uint32_t)(li + 2), line, i == s_menu_sel ? 1 : 0);
+        menu_text(1, (uint32_t)(li + 3), line, i == s_menu_sel ? 1 : 0);
         li++;
     }
     if (s_menu_cap)
-        menu_text(1, (uint32_t)(li + 2), "PRESS A KEY (ESC CANCELS)", 0);
+        menu_text(1, (uint32_t)(li + 3), "PRESS A KEY (ESC CANCELS)", 0);
     else {
-        menu_text(1, (uint32_t)(li + 2), "ARROWS MOVE ENTER SELECT", 0);
-        menu_text(1, (uint32_t)(li + 3), "LEFT RIGHT ADJUST ESC QUIT", 0);
+        menu_text(1, (uint32_t)(li + 3), "ARROWS MOVE ENTER SELECT TAB SECTION", 0);
+        menu_text(1, (uint32_t)(li + 4), "LEFT RIGHT ADJUST ESC QUIT", 0);
     }
 }
 
@@ -3909,13 +4031,52 @@ static void menu_apply_volume(int v)
     s_menu_dirty = 1;
 }
 
+/* Anisotropy levels the menu cycles through, capped by the device limit. */
+static int menu_aniso_next(int cur, int dir)
+{
+    static const int lv[] = { 0, 2, 4, 8, 16 };
+    int i, n = 0;
+    for (i = 1; i < 5; i++)
+        if ((float)lv[i] <= s_max_aniso)
+            n = i;
+    /* n = highest available index; 0 (OFF) is always available. */
+    for (i = 0; i < 5; i++)
+        if (lv[i] == cur)
+            break;
+    if (i > n)
+        i = 0;
+    if (dir >= 0)
+        i = i >= n ? 0 : i + 1;
+    else
+        i = i <= 0 ? n : i - 1;
+    for (; i >= 0 && (float)lv[i] > s_max_aniso; i--)
+        ;
+    return lv[i < 0 ? 0 : i];
+}
+
+static void menu_apply_aniso(int a)
+{
+    char v[8];
+    if (a < 0) a = 0;
+    if (a > 16) a = 16;
+    s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 0;
+    if (s_aniso > 0 && (!s_have_aniso || (float)s_aniso > s_max_aniso))
+        s_aniso = s_have_aniso ? (int)s_max_aniso : 0;
+    snprintf(v, sizeof v, "%d", s_aniso);
+    xbox_CfgSet("ANISO", v);
+    s_menu_dirty = 1;
+    fprintf(stderr, "  [VK] anisotropic filtering %s\n",
+            s_aniso ? v : "off");
+}
+
 static void menu_move(int dir)
 {
-    int i = s_menu_sel;
+    int i = s_menu_sel, start, end;
+    menu_tab_range(s_menu_tab, &start, &end);
     do {
         i += dir;
-        if (i < 0) i = (int)MENU_NROWS - 1;
-        if (i >= (int)MENU_NROWS) i = 0;
+        if (i < start) i = end - 1;
+        if (i >= end) i = start;
     } while (s_menu_rows[i].kind == MK_HEAD);
     s_menu_sel = i;
     s_menu_dirty = 1;
@@ -3927,6 +4088,8 @@ static void menu_adjust(int dir)
     if (r->kind == MK_SCALE) {
         int k = menu_scale_cur() + dir;
         menu_apply_scale(k < 1 ? 3 : k > 3 ? 1 : k);
+    } else if (r->kind == MK_ANISO) {
+        menu_apply_aniso(menu_aniso_next(s_aniso, dir));
     } else if (r->kind == MK_VSYNC) {
         menu_apply_vsync(!s_sc_vsync);
     } else if (r->kind == MK_VOL) {
@@ -3940,6 +4103,8 @@ static void menu_activate(void)
     if (r->kind == MK_SCALE) {
         int k = menu_scale_cur() + 1;
         menu_apply_scale(k > 3 ? 1 : k);
+    } else if (r->kind == MK_ANISO) {
+        menu_apply_aniso(menu_aniso_next(s_aniso, 1));
     } else if (r->kind == MK_VSYNC) {
         menu_apply_vsync(!s_sc_vsync);
     } else if (r->kind == MK_KEY) {
@@ -3981,6 +4146,7 @@ static void menu_key(SDL_Scancode sc, SDL_Keycode sym)
     case SDL_SCANCODE_LEFT: menu_adjust(-1); break;
     case SDL_SCANCODE_RIGHT: menu_adjust(1); break;
     case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: menu_activate(); break;
+    case SDL_SCANCODE_TAB: menu_tab_goto(s_menu_tab + 1); break;
     case SDL_SCANCODE_ESCAPE: xbox_MenuToggle(); break;
     default: break;
     }
