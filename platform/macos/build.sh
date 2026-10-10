@@ -28,10 +28,10 @@
 #                   (default: the machine's own, so Intel Macs build Intel
 #                   binaries with their /usr/local Homebrew and Apple
 #                   Silicon builds arm64 with /opt/homebrew -- just run it).
-#                   Cross-compiling (e.g. ARCH=x86_64 on Apple Silicon)
-#                   needs matching-arch Homebrew bottles, which a stock
-#                   single-arch Homebrew does not provide; prefer a native
-#                   build on each machine.
+#                   Cross-compiling x86_64 on Apple Silicon goes through a
+#                   Rosetta Homebrew in /usr/local (installed separately;
+#                   the script fails naming it if missing) and passes
+#                   -DCMAKE_PREFIX_PATH so CMake finds those bottles.
 #   VULKAN          1 (default) Vulkan on MoltenVK. 0 builds the GL renderer,
 #                   which has no window path on macOS yet: it would hit the
 #                   same Cocoa main-thread rule that used to leave the Vulkan
@@ -48,7 +48,13 @@ JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 VK="${VULKAN:-1}"
 GEN="${NFSU2_GEN_DIR:-$REPO/xboxrecomp/gen}"
 # Native architecture by default (arm64 on Apple Silicon, x86_64 on Intel).
-case "${ARCH:-$(uname -m 2>/dev/null)}" in
+NATIVE="$(uname -m 2>/dev/null)"
+case "$NATIVE" in
+    arm64|aarch64)   NATIVE=arm64 ;;
+    x86_64|amd64)   NATIVE=x86_64 ;;
+    *)              NATIVE="" ;;
+esac
+case "${ARCH:-$NATIVE}" in
     arm64|aarch64)  ARCH=arm64 ;;
     x86_64|amd64)   ARCH=x86_64 ;;
     *)              ARCH="" ;;  # unknown: let the compiler default decide
@@ -56,11 +62,30 @@ esac
 
 fail() { echo "error: $*" >&2; exit 1; }
 
+# The brew that owns this build's dependencies. Native builds use the
+# machine's own Homebrew; cross-compiling x86_64 on Apple Silicon needs a
+# Rosetta Homebrew (conventionally /usr/local, while the native arm64 one
+# lives in /opt/homebrew). Stored as an array because the Rosetta one must
+# run under arch -x86_64.
+BREW=(brew)
+if [ "$(uname -s)" = "Darwin" ] && [ -n "$ARCH" ] && [ -n "$NATIVE" ] && [ "$ARCH" != "$NATIVE" ]; then
+    if [ "$ARCH" = "x86_64" ]; then
+        /usr/bin/arch -x86_64 /usr/bin/true 2>/dev/null \
+            || fail "cross-compiling for x86_64 needs Rosetta (softwareupdate --install-rosetta)"
+        [ -x /usr/local/bin/brew ] \
+            || fail "cross-compiling for x86_64 needs an x86_64 Homebrew (install it with: arch -x86_64 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"), then: brew install cmake pkg-config molten-vk vulkan-loader sdl2 libepoxy openssl@3 glslang spirv-tools"
+        BREW=(/usr/bin/arch -x86_64 /usr/local/bin/brew)
+        echo "cross-compiling for $ARCH with Rosetta Homebrew (/usr/local)"
+    else
+        fail "cross-compiling for $ARCH on this $NATIVE machine is not supported"
+    fi
+fi
+
 # Homebrew's .pc files (epoxy, sdl2) are outside pkg-config's default path on
 # Apple Silicon, and a clean environment then fails to find epoxy. Before the
 # checks below, so that "pkg-config --exists epoxy" sees them too.
 if [ "$(uname -s)" = "Darwin" ]; then
-    HPREFIX="${HOMEBREW_PREFIX:-$(brew --prefix 2>/dev/null || echo /opt/homebrew)}"
+    HPREFIX="${HOMEBREW_PREFIX:-$("${BREW[@]}" --prefix 2>/dev/null || echo /opt/homebrew)}"
     export PKG_CONFIG_PATH="$HPREFIX/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 fi
 
@@ -105,6 +130,56 @@ ARCH_ARGS=()
 if [ -n "$ARCH" ]; then
     ARCH_ARGS=(-DCMAKE_OSX_ARCHITECTURES="$ARCH")
     echo "target architecture: $ARCH"
+fi
+# In cross mode, point CMake at the foreign prefix first so find_package
+# (Vulkan, etc.) resolves the matching-arch libraries, not the native ones
+# CMake would otherwise prefer from its built-in search paths.
+if [ -n "$ARCH" ] && [ -n "$NATIVE" ] && [ "$ARCH" != "$NATIVE" ]; then
+    ARCH_ARGS+=(-DCMAKE_PREFIX_PATH="$HPREFIX")
+fi
+
+# A build dir that previously built another arch holds stale .o files the
+# linker would then mix in ("symbol(s) not found for architecture X"):
+# detect the switch and force a clean reconfigure (only CMake's own state
+# is removed, never sources). Prefer a separate BUILD_DIR per arch.
+if [ -n "$ARCH" ] && [ -n "$BUILD" ] && [ "$BUILD" != "/" ] && [ -f "$BUILD/CMakeCache.txt" ]; then
+    cached="$(grep '^CMAKE_OSX_ARCHITECTURES:' "$BUILD/CMakeCache.txt" 2>/dev/null | cut -d= -f2-)"
+    if [ -n "$cached" ] && [ "$cached" != "$ARCH" ]; then
+        echo "architecture changed ($cached -> $ARCH): clearing CMake cache for a clean rebuild"
+        rm -rf "$BUILD/CMakeCache.txt" "$BUILD/CMakeFiles"
+    fi
+fi
+
+# Cross-compiling needs matching-arch bottles for every Homebrew dep; a
+# stock single-arch Homebrew cannot provide them. Fail fast naming the
+# culprits instead of dying later with a cryptic linker error.
+if [ -n "$ARCH" ] && [ -n "$NATIVE" ] && [ "$ARCH" != "$NATIVE" ]; then
+    bad=""
+    for lib in \
+        "$HPREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
+        "$HPREFIX/opt/sdl3/lib/libSDL3.0.dylib" \
+        "$HPREFIX/opt/sdl2-compat/lib/libSDL2-2.0.0.dylib" \
+        "$HPREFIX/opt/libepoxy/lib/libepoxy.0.dylib" \
+        "$HPREFIX/opt/openssl@3/lib/libcrypto.3.dylib" \
+        "$HPREFIX/opt/glslang/lib/libglslang.16.dylib" \
+        "$HPREFIX/opt/spirv-tools/lib/libSPIRV-Tools.dylib" \
+        "$HPREFIX/lib/libMoltenVK.dylib" \
+        "$FFMPEG_DIR/lib/libavcodec.a" \
+        "$FFMPEG_DIR/lib/libavformat.a" \
+        "$FFMPEG_DIR/lib/libavutil.a" \
+        "$FFMPEG_DIR/lib/libswscale.a"; do
+        [ -e "$lib" ] || continue
+        case " $(lipo -archs "$lib" 2>/dev/null) " in
+            *" $ARCH "*) ;;
+            *) bad="$bad
+  $lib" ;;
+        esac
+    done
+    if [ -n "$bad" ]; then
+        fail "cannot target $ARCH: these libraries lack that slice:$bad
+       install matching-arch bottles for them (for x86_64-on-arm64: a Rosetta Homebrew in /usr/local with the same formulae)"
+    fi
+    echo "cross-compiling for $ARCH (Homebrew deps checked)"
 fi
 
 cmake -S "$REPO" -B "$BUILD" -DCMAKE_BUILD_TYPE=RelWithDebInfo \
