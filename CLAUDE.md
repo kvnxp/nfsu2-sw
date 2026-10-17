@@ -213,6 +213,16 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   (`xbox_nx_pad_rumble`: left = low band 160 Hz, right = high band 320 Hz,
   handheld + player 1), SDL rumble on Linux. Only changes are sent.
   `RECOMP_RUMBLE=0` off, `RECOMP_RUMBLE_TRACE=1` logs each change.
+  Strength: Options -> Gameplay -> Vibration Off/10%..100% (2026-10-11,
+  recomp_manual.c sub_000CEA00 wrapper, same row recipe as Video; scales
+  both motors in usb_gamepad_output via `usb_gamepad_rumble_pct`; saved as
+  vibration=<pct> in nfsu2x_options.txt). Texts (text_patch.c s_always):
+  "Keyboard Configuration" -> Vibration, Crowds/High/Medium/Refresh/World
+  Detail/Particle System/Game Filters/Wheel Options x2/Wheel Configuration
+  -> 10%..100% (each hash only in the 28 string tables). Linux path: Main
+  Menu (after the profile OK, b is harmless) right x6 -> a (Options opens
+  on Audio) -> right x2 (Gameplay) -> a -> down x7; FE input lags a few s
+  under lavapipe, so space presses 2-5 s apart.
 - **Render scale:** `RECOMP_GL_SCALE=<k>` (0.5..4, fractions like 1.5 ok;
   nv2a_gl.c and nv2a_vk.c) stores every surface at that multiple, rounded
   (`GlSurf/VkSurf.pw/ph`; `w/h` stay the title's pixels
@@ -248,6 +258,18 @@ The toolkit is vendored in `xboxrecomp/`; the default for `XBOXRECOMP_DIR`.
   grows, draws are scissored to the clip (like xemu), and a render target
   sampled as a smaller texture gets its texcoords scaled (`rt_scale`).
   Menu dumps run ~60 frames/s: RECOMP_GL_DUMP=<p>,61 is about one a second.
+- **Audio volumes not kept (issue #21, fixed 2026-10-13, recomp_manual.c
+  sub_00076A70 wrapper):** the Xbox game never saves them. The six
+  sliders are floats in the options object 0x406CA0 (block at 0x406CE8:
+  menu music +0x08, game music +0x0C, speech +0x04, sfx +0x10, tires
+  +0x18, engine +0x14; a static constructor fills them after boot), and
+  the profile writer sub_001371B0 copies the object around that block.
+  Now menu_music=/game_music=/speech=/sfx=/tires=/engine= (0..1) in
+  nfsu2x_options.txt, put back at the first sub_00076A70 call (profile
+  apply, sub_00141070), saved when a slider changes one. Log
+  `[options] volumes ... (restored)`. Linux path to Audio: Main Menu right
+  x6 -> a -> a; Profile Manager is left of Options (Save = right x2, two
+  Yes/No boxes that default to No).
 - Buttons map by label (Switch A = Xbox A); `RECOMP_PAD_LAYOUT=position`
   swaps to Xbox positions. Y opens the in-game Help box, closed with B.
 

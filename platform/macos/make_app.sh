@@ -32,6 +32,11 @@
 #   APP         output bundle (default $BUILD_DIR/NFSU2.app)
 #   RECOPY=1    with GAME_DIR: discard the previous bundle copy, copy again
 #   NO_BUILD=1  package the binary as it is, skip platform/macos/build.sh
+#   ARCH        passed through to build.sh (arm64/x86_64, default native).
+#               Packagers follow the binary: a cross-built x86_64 bundle on
+#               Apple Silicon resolves its dylibs from the Rosetta Homebrew;
+#               the bundled dylibs must match the binary's architecture
+#               (checked with lipo before signing).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -39,6 +44,10 @@ BUILD="${BUILD_DIR:-$REPO/build}"
 BIN="$BUILD/nfsu2_recomp"
 APP="${APP:-$BUILD/NFSU2.app}"
 HPREFIX="${HOMEBREW_PREFIX:-$(brew --prefix 2>/dev/null || echo /opt/homebrew)}"
+if [ "$HPREFIX" = "/opt/homebrew" ] && [ "$(uname -m 2>/dev/null)" != "arm64" ] && ! [ -d /opt/homebrew ]; then
+    # Intel Mac without brew in PATH: Homebrew lives in /usr/local there.
+    HPREFIX=/usr/local
+fi
 
 fail() { echo "error: $*" >&2; exit 1; }
 
@@ -58,6 +67,28 @@ if [ -z "${NO_BUILD:-}" ]; then
     "$REPO/platform/macos/build.sh"
 fi
 [ -x "$BIN" ] || fail "no $BIN after the build"
+
+# Match Homebrew to the BINARY, not the machine: a cross-built x86_64
+# binary links /usr/local bottles, which the native arm64 brew would never
+# resolve (and vice versa). build.sh already selected correctly when it
+# built; this also covers NO_BUILD=1 with a shipped binary.
+if [ -z "${HOMEBREW_PREFIX:-}" ]; then
+    BIN_ARCH="$(lipo -archs "$BIN" 2>/dev/null | tr ' ' '\n' | head -1)"
+    NATIVE_M="$(uname -m 2>/dev/null)"
+    case "$NATIVE_M" in
+        arm64|aarch64) NATIVE_M=arm64 ;;
+        x86_64|amd64)  NATIVE_M=x86_64 ;;
+        *)             NATIVE_M="" ;;
+    esac
+    if [ -n "$BIN_ARCH" ] && [ -n "$NATIVE_M" ] && [ "$BIN_ARCH" != "$NATIVE_M" ]; then
+        if [ "$BIN_ARCH" = "x86_64" ] && [ -x /usr/local/bin/brew ]; then
+            HPREFIX="$(/usr/bin/arch -x86_64 /usr/local/bin/brew --prefix 2>/dev/null || echo /usr/local)"
+            echo "packaging $BIN_ARCH binary with Rosetta Homebrew ($HPREFIX)"
+        else
+            fail "no matching-arch Homebrew for this $BIN_ARCH binary (this machine is $NATIVE_M)"
+        fi
+    fi
+fi
 
 is_brew_dep() {
     case "$1" in
@@ -276,6 +307,18 @@ if [ -f "$SRC_ICON" ]; then
     iconutil -c icns "$SET" -o "$RES/AppIcon.icns"
     rm -rf "$SET"
 fi
+
+# Every bundled image must contain the binary's architecture (e.g. an
+# arm64-only Homebrew cannot feed an x86_64 bundle: build natively instead).
+want="$(lipo -archs "$MACOS/nfsu2_recomp" 2>/dev/null | tr ' ' '\n' | head -1)"
+for f in "$FW"/*.dylib; do
+    have="$(lipo -archs "$f" 2>/dev/null || true)"
+    case " $have " in
+        *" $want "*) ;;
+        *) fail "$f has [$have] but the app is [$want] -- install matching-arch Homebrew bottles (no cross-arch mixing)" ;;
+    esac
+done
+[ -n "$want" ] && echo "arch: $want ($(ls "$FW"/*.dylib | wc -l | tr -d ' ') bundled dylibs)"
 
 # Ad-hoc signature: arm64 refuses unsigned code, and install_name_tool broke
 # whatever the linker and Homebrew had signed.
