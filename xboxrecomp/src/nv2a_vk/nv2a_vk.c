@@ -2545,7 +2545,7 @@ static int ready(void)
                 s_aniso = (int)s_max_aniso;
             if (s_aniso > 0)
                 fprintf(stderr, "  [VK] anisotropic filtering x%d (of %.0f)\n",
-                        s_aniso, s_max_aniso);
+                        (int)s_aniso, s_max_aniso);
         }
     }
     {
@@ -3636,7 +3636,7 @@ static void vk_draw_raw(const Nv2aRawBatch *b)
                         else
                             p = b->attrs + ((size_t)v * NV2A_RAW_ATTRS) * 4;
                     } else {
-                        p = b->attr_const + 0;
+                        p = b->attr_const[0];
                     }
                     memcpy(tmp, p, sizeof tmp);
                     fprintf(stderr, "[VKD]   pos[%u] = %g %g %g %g%s\n", v, tmp[0], tmp[1],
@@ -4049,12 +4049,14 @@ static const uint8_t *font_get(char c)
     return s_font_data[p - s_font_chars];
 }
 
-enum { MK_HEAD, MK_SCALE, MK_ANISO, MK_VSYNC, MK_KEY, MK_KEY2, MK_KEYRESET, MK_VOL };
+enum { MK_HEAD, MK_SCALE, MK_ANISO, MK_FXAA, MK_SQUARE, MK_VSYNC, MK_KEY, MK_KEY2, MK_KEYRESET, MK_VOL };
 typedef struct { int kind; const char *label; int vk, vk2, d1, d2; } MenuRow;
 static const MenuRow s_menu_rows[] = {
     { MK_HEAD, "GRAPHICS", 0, 0, 0, 0 },
     { MK_SCALE, "SCALE", 0, 0, 0, 0 },
     { MK_ANISO, "ANISO", 0, 0, 0, 0 },
+    { MK_FXAA, "FXAA", 0, 0, 0, 0 },        /* the game's Anti-Aliasing row */
+    { MK_SQUARE, "SQUARE", 0, 0, 0, 0 },    /* the game's Square Pixels row */
     { MK_HEAD, "VIDEO", 0, 0, 0, 0 },
     { MK_VSYNC, "VSYNC", 0, 0, 0, 0 },
     { MK_HEAD, "AUDIO", 0, 0, 0, 0 },
@@ -4173,27 +4175,36 @@ static void menu_value(const MenuRow *r, char *out, size_t cap)
     int o;
     switch (r->kind) {
     case MK_SCALE: {
-        double v = s_scale_pending ? s_scale_new : s_scale;
-        int k = (int)(v + 0.5);
-        if (k < 1) k = 1;
-        if (k > 3) k = 3;
-        snprintf(out, cap, "X%d", k);
+        /* The game's Resolution Scale row is the source of truth: same
+         * values (1x, 1.5x, 2x, 2.5x) through nv2a_vk_scale_pct. */
+        double v = nv2a_vk_scale_pct >= 50 ? nv2a_vk_scale_pct / 100.0
+                                          : (s_scale_pending ? s_scale_new : s_scale);
+        snprintf(out, cap, "X%G", v);
         return;
     }
     case MK_VSYNC:
         snprintf(out, cap, "%s", s_sc_vsync ? "ON" : "OFF");
         return;
-    case MK_ANISO:
-        if (s_aniso >= 16)
+    case MK_ANISO: {
+        /* Same channel as the game's Anisotropic row: nv2a_vk_aniso. */
+        int a = nv2a_vk_aniso;
+        if (a >= 16)
             snprintf(out, cap, "X16");
-        else if (s_aniso >= 8)
+        else if (a >= 8)
             snprintf(out, cap, "X8");
-        else if (s_aniso >= 4)
+        else if (a >= 4)
             snprintf(out, cap, "X4");
-        else if (s_aniso >= 2)
+        else if (a >= 2)
             snprintf(out, cap, "X2");
         else
             snprintf(out, cap, "OFF");
+        return;
+    }
+    case MK_FXAA:
+        snprintf(out, cap, "%s", fxaa_on() ? "ON" : "OFF");
+        return;
+    case MK_SQUARE:
+        snprintf(out, cap, "%s", nv2a_vk_square ? "ON" : "OFF");
         return;
     case MK_VOL:
         snprintf(out, cap, "%d", xbox_AudioGetVolume100());
@@ -4326,27 +4337,36 @@ static void menu_build(void)
     }
 }
 
+/* The game's Resolution Scale values, in percent, as a single source of
+ * truth: the F1 row cycles through the same four settings, so both menus
+ * always agree. */
+static const int s_scale_steps[] = { 100, 150, 200, 250 };
+
 static int menu_scale_cur(void)
 {
-    double v = s_scale_pending ? s_scale_new : s_scale;
-    int k = (int)(v + 0.5);
-    return k < 1 ? 1 : k > 3 ? 3 : k;
+    double v = nv2a_vk_scale_pct >= 50 ? nv2a_vk_scale_pct / 100.0
+                                      : (s_scale_pending ? s_scale_new : s_scale);
+    int i, t = (int)(v * 2 + 0.5);          /* nearest half step */
+    for (i = 0; i < 4; i++)
+        if (s_scale_steps[i] / 2 >= t)
+            break;
+    return i < 4 ? i : 3;
 }
 
-static void menu_apply_scale(int k)
+static void menu_apply_scale(int idx)
 {
     char v[8];
-    if (k < 1) k = 1;
-    if (k > 3) k = 3;
-    snprintf(v, sizeof v, "%d", k);
-    xbox_CfgSet("SCALE", v);
-    s_scale_new = (double)k;
-    s_scale_pending = 1;
-    /* Keep the in-game row (nv2a_vk_scale_pct, applied at flip) in sync so
-     * the two scale controls never fight each other. */
-    nv2a_vk_scale_pct = k * 100;
+    int pct;
+    if (idx < 0) idx = 0;
+    if (idx > 3) idx = 3;
+    pct = s_scale_steps[idx];
+    snprintf(v, sizeof v, "%d", pct / 100);
+    xbox_CfgSet("SCALE", v);                /* boot-time default, pre-game */
+    nv2a_vk_scale_pct = pct;
+    s_scale_new = pct / 100.0;
+    s_scale_pending = 0;                    /* the flip applies the pct now */
     s_menu_dirty = 1;
-    fprintf(stderr, "  [VK] render scale x%d at the next frame\n", k);
+    fprintf(stderr, "  [VK] render scale x%G at the next frame\n", pct / 100.0);
 }
 
 static void menu_apply_vsync(int on)
@@ -4399,6 +4419,8 @@ static void menu_apply_aniso(int a)
     char v[8];
     if (a < 0) a = 0;
     if (a > 16) a = 16;
+    nv2a_vk_aniso = a;                      /* live, same var the game row writes */
+    /* Cap for boot and for the device limit. */
     s_aniso = a >= 16 ? 16 : a >= 8 ? 8 : a >= 4 ? 4 : a >= 2 ? 2 : 0;
     if (s_aniso > 0 && (!s_have_aniso || (float)s_aniso > s_max_aniso))
         s_aniso = s_have_aniso ? (int)s_max_aniso : 0;
@@ -4406,7 +4428,7 @@ static void menu_apply_aniso(int a)
     xbox_CfgSet("ANISO", v);
     s_menu_dirty = 1;
     fprintf(stderr, "  [VK] anisotropic filtering %s\n",
-            s_aniso > 0 ? v : "off");
+            a > 0 ? v : "off");
 }
 
 static void menu_move(int dir)
@@ -4426,10 +4448,18 @@ static void menu_adjust(int dir)
 {
     const MenuRow *r = &s_menu_rows[s_menu_sel];
     if (r->kind == MK_SCALE) {
-        int k = menu_scale_cur() + dir;
-        menu_apply_scale(k < 1 ? 3 : k > 3 ? 1 : k);
+        int i = menu_scale_cur() + dir;
+        menu_apply_scale(i < 0 ? 3 : i > 3 ? 0 : i);
     } else if (r->kind == MK_ANISO) {
-        menu_apply_aniso(menu_aniso_next(s_aniso, dir));
+        menu_apply_aniso(menu_aniso_next(nv2a_vk_aniso, dir));
+    } else if (r->kind == MK_FXAA) {
+        nv2a_vk_fxaa = !fxaa_on();
+        s_menu_dirty = 1;
+        fprintf(stderr, "  [VK] fxaa %s\n", nv2a_vk_fxaa ? "on" : "off");
+    } else if (r->kind == MK_SQUARE) {
+        nv2a_vk_square = !nv2a_vk_square;
+        s_menu_dirty = 1;
+        fprintf(stderr, "  [VK] square pixels %s\n", nv2a_vk_square ? "on" : "off");
     } else if (r->kind == MK_VSYNC) {
         menu_apply_vsync(!s_sc_vsync);
     } else if (r->kind == MK_VOL) {
@@ -4441,10 +4471,13 @@ static void menu_activate(void)
 {
     const MenuRow *r = &s_menu_rows[s_menu_sel];
     if (r->kind == MK_SCALE) {
-        int k = menu_scale_cur() + 1;
-        menu_apply_scale(k > 3 ? 1 : k);
+        menu_apply_scale(menu_scale_cur() + 1 > 3 ? 0 : menu_scale_cur() + 1);
     } else if (r->kind == MK_ANISO) {
-        menu_apply_aniso(menu_aniso_next(s_aniso, 1));
+        menu_apply_aniso(menu_aniso_next(nv2a_vk_aniso, 1));
+    } else if (r->kind == MK_FXAA) {
+        nv2a_vk_fxaa = !fxaa_on();
+    } else if (r->kind == MK_SQUARE) {
+        nv2a_vk_square = !nv2a_vk_square;
     } else if (r->kind == MK_VSYNC) {
         menu_apply_vsync(!s_sc_vsync);
     } else if (r->kind == MK_KEY) {
@@ -5022,8 +5055,37 @@ static void vk_flip(void)
             if (dw > 0 && dh > 0 && fxaa_on()
                 && present_fxaa(s, dst, s_sc_views[idx], s_sc_format, s_sc_extent, dx, dy, dw, dh,
                                 VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT))
+                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT)) {
+#if !defined(__SWITCH__) && !defined(_WIN32)
+                /* The F1 menu over the FXAA output too: present_fxaa left
+                 * dst in PRESENT_SRC, so bring it back through TRANSFER_DST
+                 * for the panel blit and return it before presenting. */
+                if (xbox_MenuOpen()) {
+                    memset(&b, 0, sizeof b);
+                    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    b.srcAccessMask = 0;
+                    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    b.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    b.image = dst;
+                    b.subresourceRange = rg;
+                    vkCmdPipelineBarrier(s_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+                    menu_draw(dst);
+                    memset(&b, 0, sizeof b);
+                    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    b.dstAccessMask = 0;
+                    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    b.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+                    b.image = dst;
+                    b.subresourceRange = rg;
+                    vkCmdPipelineBarrier(s_cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+                }
+#endif
                 goto presented;
+            }
             b.srcAccessMask = 0;
             b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
