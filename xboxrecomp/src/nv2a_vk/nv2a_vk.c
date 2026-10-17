@@ -144,11 +144,12 @@ static VkExtent2D     s_sc_extent;
 static uint32_t       s_sc_count;
 static VkImage        s_sc_images[8];
 static VkImageView    s_sc_views[8];
+/* Signalled by the frame's submit, waited on by the present of the same
+ * image. Per image, not per frame: a frame's fence does not cover the
+ * presentation wait, so a per-frame semaphore could be re-signalled while
+ * the previous present still waits on it. */
+static VkSemaphore    s_sc_rendered[8];
 static int            s_headless;
-/* Render-finished semaphores, one per swapchain image: a present waits on
- * image i's, and only a later acquire of image i can re-signal it. One per
- * frame would be re-signalled while a present still holds it. */
-static VkSemaphore    s_rend[8];
 #if !defined(__SWITCH__)
 static SDL_Window    *s_win;
 #endif
@@ -327,8 +328,13 @@ typedef struct {
  * Horizontal: s_scale times s_xratio, 1 unless RECOMP_GL_SCALE_X sets the
  * horizontal scale outright (a game option's rescale keeps the ratio).
  * s_square: widescreen shows the title's 640x480 at 16:9, so surfaces
- * without horizontal AA get 4/3 more columns -- square pixels (races: 1.5x
+ * narrower than 1280 get 4/3 more columns -- square pixels (races: 1.5x
  * -> 1280x720). The front end's 1280x480 (aa 2x1) is wide enough already.
+ * Decided by the width alone, never the AA mode: surfaces that share a zeta
+ * buffer must get the same stored size, or depth_get hands the second one a
+ * fresh, empty depth buffer. The garage draws the car into the 1280x480 aa
+ * 2x1 back buffer and the neon into a 1280-wide target without AA on the
+ * same Z; widened by AA mode, the neon showed through the car (issue #32).
  * RECOMP_VK_SQUARE=0 off; RECOMP_GL_SCALE_X overrides it. */
 static double   s_scale_x = 1.0, s_xratio = 1.0;
 static int      s_square, s_square_env;
@@ -350,9 +356,9 @@ volatile int nv2a_vk_scale_pct;
 
 /* The stored size of a w x h surface at the current scale, capped per axis
  * by the device's image limits. */
-static void stored_size(uint32_t w, uint32_t h, uint32_t aa_sx, uint32_t *pw, uint32_t *ph)
+static void stored_size(uint32_t w, uint32_t h, uint32_t *pw, uint32_t *ph)
 {
-    double kx = s_scale_x * (s_square && aa_sx <= 1 ? 4.0 / 3.0 : 1.0), ky = s_scale;
+    double kx = s_scale_x * (s_square && w < 1280 ? 4.0 / 3.0 : 1.0), ky = s_scale;
     if (w * kx > (double)s_max_size)
         kx = (double)s_max_size / w;
     if (h * ky > (double)s_max_size)
@@ -613,7 +619,7 @@ static VkSurf *surf_get(uint32_t va, uint32_t w, uint32_t h, uint32_t aa_sx, uin
     memset(s, 0, sizeof *s);
     s->va = va; s->w = w; s->h = h; s->used = s_frame;
     s->aa_sx = aa_sx; s->aa_sy = aa_sy;
-    stored_size(w, h, aa_sx, &s->pw, &s->ph);
+    stored_size(w, h, &s->pw, &s->ph);
     if (!make_image(s->pw, s->ph, VK_FORMAT_B8G8R8A8_UNORM,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -649,7 +655,7 @@ static void rescale_surfaces(double k)
         uint32_t pw, ph;
         if (!s->image)
             continue;
-        stored_size(s->w, s->h, s->aa_sx, &pw, &ph);
+        stored_size(s->w, s->h, &pw, &ph);
         if (pw == s->pw && ph == s->ph)
             continue;
         if (!make_image(pw, ph, VK_FORMAT_B8G8R8A8_UNORM,
@@ -779,6 +785,7 @@ typedef struct {
     uint32_t va, color, w, h, pitch, hash, bytes;
     uint32_t face;              /* cube map: bytes per face; 0 = 2D */
     uint32_t levels;            /* mip levels in the image */
+    uint32_t palette_va, palette_reg;   /* format 0x0B: the palette it was decoded with */
     VkImage image; VkImageView view; VkDeviceMemory mem;
     VkFormat fmt;
     uint32_t used, checked;
@@ -1115,10 +1122,15 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
     VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
     uint32_t layers = face ? 6 : 1, f, size;
 
+    if (s_have_bc && color == 0x0C) fmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+    if (s_have_bc && color == 0x0E) fmt = VK_FORMAT_BC2_UNORM_BLOCK;
+    if (s_have_bc && color == 0x0F) fmt = VK_FORMAT_BC3_UNORM_BLOCK;
+
     for (i = s_tex_head[tex_bucket(va, color, w, h)]; i; i = s_tex_next[i - 1]) {
         VkTex *c = &s_tex[i - 1];
         if (c->image && c->va == va && c->color == color && c->w == w && c->h == h
-            && c->face == face) {
+            && c->face == face && c->pitch == pitch && c->levels == levels && c->fmt == fmt
+            && (color != 0x0B || (c->palette_va == s_palette_va && c->palette_reg == s_palette_reg))) {
             t = c;
             break;
         }
@@ -1127,7 +1139,17 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
         t->used = s_frame;
         return t->view;
     }
-    hash = bytes_hash(va, face ? face * 6 : tex_bytes(color, w, h, pitch));
+    size = tex_bytes(color, w, h, pitch);
+    if (!face && fmt != VK_FORMAT_B8G8R8A8_UNORM) {
+        /* DXT mip levels are uploaded from guest memory (they follow level 0),
+         * so a change to them alone must re-upload too. */
+        uint32_t lw = w, lh = h, level;
+        for (level = 1; level < levels; level++) {
+            lw = lw > 1 ? lw / 2 : 1; lh = lh > 1 ? lh / 2 : 1;
+            size += tex_bytes(color, lw, lh, 0);
+        }
+    }
+    hash = bytes_hash(va, face ? face * 6 : size);
     if (color == 0x0B)
         hash ^= bytes_hash(s_palette_va, 1024) * 31u;
     if (t && t->hash == hash) {
@@ -1141,13 +1163,6 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
     if (t && s_tex_changes)
         fprintf(stderr, "[tex] frame %u: %08X format %02X %ux%u changed\n",
                 s_frame, va, color, w, h);
-    if (s_have_bc && color == 0x0C) fmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-    if (s_have_bc && color == 0x0E) fmt = VK_FORMAT_BC2_UNORM_BLOCK;
-    if (s_have_bc && color == 0x0F) fmt = VK_FORMAT_BC3_UNORM_BLOCK;
-    if (t && (t->fmt != fmt || t->pitch != pitch || t->levels != levels)) {
-        tex_free(t);
-        t = NULL;
-    }
     if (!t) {
         for (i = 0; i < VK_MAX_TEX; i++) {
             VkTex *c = &s_tex[i];
@@ -1159,6 +1174,7 @@ static VkImageView tex_get(uint32_t va, uint32_t color, uint32_t w, uint32_t h, 
             tex_free(t);
         t->va = va; t->color = color; t->w = w; t->h = h; t->pitch = pitch; t->fmt = fmt;
         t->face = face; t->levels = levels;
+        t->palette_va = s_palette_va; t->palette_reg = s_palette_reg;
         VT("texture %08X fmt %02X %ux%u pitch %u%s\n", va, color, w, h, pitch,
            face ? " cube" : "");
         if (!make_image_ml(w, h, layers, levels, fmt,
@@ -2285,6 +2301,11 @@ static int create_swapchain(void)
     s_sc_count = 8;
     vkGetSwapchainImagesKHR(s_dev, s_swapchain, &s_sc_count, s_sc_images);
     for (i = 0; i < s_sc_count; i++) {
+        if (!s_sc_rendered[i]) {
+            VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            if (vkCreateSemaphore(s_dev, &sci, NULL, &s_sc_rendered[i]) != VK_SUCCESS)
+                s_sc_rendered[i] = VK_NULL_HANDLE;
+        }
         VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         vi.image = s_sc_images[i];
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
@@ -2448,6 +2469,11 @@ static int ready(void)
                 k = strtod(v, NULL);
         }
 #endif
+        /* The title's option, when it set one before we got here (NFSU2
+         * loads it at boot, 1.5x by default): start at it rather than
+         * rebuilding every surface at the first flip. */
+        if (nv2a_vk_scale_pct >= 50)
+            k = nv2a_vk_scale_pct / 100.0;
         if (pp.limits.maxFramebufferWidth < m) m = pp.limits.maxFramebufferWidth;
         if (pp.limits.maxFramebufferHeight < m) m = pp.limits.maxFramebufferHeight;
         s_max_size = m ? m : 4096;
@@ -2759,14 +2785,6 @@ static int ready(void)
             vkMapMemory(s_dev, f->ring_mem, 0, RING_BYTES, 0, (void **)&f->ring_ptr) != VK_SUCCESS) {
             LOGE("frame ring allocation failed\n");
             return 0;
-        }
-    }
-    {
-        uint32_t ri;
-        for (ri = 0; ri < 8; ri++) {
-            VkSemaphoreCreateInfo rci2 = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-            if (vkCreateSemaphore(s_dev, &rci2, NULL, &s_rend[ri]) != VK_SUCCESS)
-                return 0;
         }
     }
     s_fi = 0;
@@ -5073,7 +5091,7 @@ static void vk_flip(void)
         si.pWaitSemaphores = &s_f->acquired;
         si.pWaitDstStageMask = &ws;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &s_rend[idx];
+        si.pSignalSemaphores = &s_sc_rendered[idx];
     }
     if (vkQueueSubmit(s_queue, 1, &si, s_f->fence) != VK_SUCCESS)
         LOGE("vkQueueSubmit failed\n");
@@ -5082,7 +5100,7 @@ static void vk_flip(void)
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
         VkResult pr;
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &s_rend[idx];
+        pi.pWaitSemaphores = &s_sc_rendered[idx];
         pi.swapchainCount = 1;
         pi.pSwapchains = &s_swapchain;
         pi.pImageIndices = &idx;
