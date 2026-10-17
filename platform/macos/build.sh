@@ -16,9 +16,11 @@
 # Usage:
 #   platform/macos/build.sh [GAME_DIR]
 #
-#   GAME_DIR   the extracted disc (a directory with default.xbe): build, then
-#              start the game with NFSU2_GAME_DIR=GAME_DIR. Everything.
-#   no argument  build only, then print the command to run.
+#   GAME_DIR   the extracted disc (a directory with default.xbe): also drives
+#              tools/regen.sh when no generated code exists yet, then build,
+#              then start the game with NFSU2_GAME_DIR=GAME_DIR. Everything.
+#   no argument  build only (seeding regen from the repo's own game/ when
+#              present), then print the command to run.
 #
 # Environment:
 #   BUILD_DIR       default <repo>/build
@@ -108,7 +110,16 @@ fi
 command -v cmake >/dev/null || fail "cmake not found (brew install cmake)"
 command -v pkg-config >/dev/null || fail "pkg-config not found (brew install pkg-config)"
 pkg-config --exists epoxy || fail "epoxy not found (brew install libepoxy)"
-[ -f "$GEN/recomp_funcs.h" ] || fail "no generated code in $GEN (run tools/regen.sh, or set NFSU2_GEN_DIR)"
+if [ ! -f "$GEN/recomp_funcs.h" ]; then
+    echo "no generated code in $GEN -- running tools/regen.sh first" >&2
+    echo "(disasm + func_id + abi + recomp; a few minutes on a clean tree)" >&2
+    if [ -n "$GAME" ]; then
+        NFSU2_XBE="$GAME/default.xbe" NFSU2_GEN_DIR="$GEN" bash "$REPO/tools/regen.sh"
+    else
+        NFSU2_GEN_DIR="$GEN" bash "$REPO/tools/regen.sh"
+    fi
+fi
+[ -f "$GEN/recomp_funcs.h" ] || fail "regen produced no code in $GEN"
 
 VK_ARGS=(-DNFSU2_VULKAN=ON)
 if [ "$VK" != "1" ]; then
