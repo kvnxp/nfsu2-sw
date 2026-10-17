@@ -4346,11 +4346,8 @@ static int menu_scale_cur(void)
 {
     double v = nv2a_vk_scale_pct >= 50 ? nv2a_vk_scale_pct / 100.0
                                       : (s_scale_pending ? s_scale_new : s_scale);
-    int i, t = (int)(v * 2 + 0.5);          /* nearest half step */
-    for (i = 0; i < 4; i++)
-        if (s_scale_steps[i] / 2 >= t)
-            break;
-    return i < 4 ? i : 3;
+    int t = (int)(v * 2 + 0.5) - 2;         /* 1.0 -> 0, 1.5 -> 1, ..., 2.5 -> 3 */
+    return t < 0 ? 0 : t > 3 ? 3 : t;
 }
 
 static void menu_apply_scale(int idx)
@@ -4360,7 +4357,7 @@ static void menu_apply_scale(int idx)
     if (idx < 0) idx = 0;
     if (idx > 3) idx = 3;
     pct = s_scale_steps[idx];
-    snprintf(v, sizeof v, "%d", pct / 100);
+    snprintf(v, sizeof v, "%G", pct / 100.0);
     xbox_CfgSet("SCALE", v);                /* boot-time default, pre-game */
     nv2a_vk_scale_pct = pct;
     s_scale_new = pct / 100.0;
